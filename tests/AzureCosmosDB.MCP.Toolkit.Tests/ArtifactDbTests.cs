@@ -230,6 +230,20 @@ public class ArtifactDbToolsMcpTests : IClassFixture<McpTestApplicationFactory>
         result["content"]![0]!["text"]!.GetValue<string>().Should().StartWith("invalid_argument: ");
     }
 
+    [Theory]
+    [InlineData("POST", "/api/mcp/tools/list_databases")]
+    [InlineData("GET", "/api/mcp/tools")]
+    [InlineData("POST", "/mcp/http")]
+    [InlineData("GET", "/index.html")]
+    public async Task The_toolkits_tester_is_not_served(string method, string path)
+    {
+        var response = await _client.SendAsync(new HttpRequestMessage(new HttpMethod(method), path)
+        {
+            Content = method == "POST" ? new StringContent("{}", Encoding.UTF8, "application/json") : null,
+        });
+        ((int)response.StatusCode).Should().BeOneOf(404, 405);
+    }
+
     [Fact]
     public async Task Bad_paths_are_invalid_arguments()
     {

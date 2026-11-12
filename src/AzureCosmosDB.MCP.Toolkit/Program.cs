@@ -311,9 +311,6 @@ app.MapHealthChecks("/health");
 // Enable CORS
 app.UseCors("MCPPolicy");
 
-// Configure static files with more explicit options
-app.UseDefaultFiles(); // This will serve index.html as default
-app.UseStaticFiles();
 
 // Add routing first
 app.UseRouting();
@@ -343,8 +340,8 @@ else
     app.MapMcp("/mcp");
 }
 
-// Add a simple root endpoint as fallback
-app.MapGet("/", () => Results.Redirect("/index.html"));
+// No web UI: the toolkit's tester (wwwroot, /api/mcp and /mcp/http) served its own tools without the artifact's
+// rules, /api/mcp without authentication, so it is removed. /mcp and /health remain.
 
 app.Run();
 
