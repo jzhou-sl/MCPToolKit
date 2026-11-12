@@ -158,6 +158,24 @@ public class ArtifactViewerTests
         ArtifactViewer.From(User("u1", "Mcp.Tool.Executor")).Level.Should().BeNull();
         ArtifactViewer.From(new ClaimsPrincipal(new ClaimsIdentity())).Level.Should().BeNull();
     }
+
+    [Fact]
+    public void Signed_in_callers_without_a_role_get_the_default_level()
+    {
+        try
+        {
+            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "interact");
+            ArtifactViewer.From(User("u1")).Level.Should().Be("interact");
+            ArtifactViewer.From(User("u1", "Cosmos.Read")).Level.Should().Be("view");
+            ArtifactViewer.From(new ClaimsPrincipal(new ClaimsIdentity())).Level.Should().BeNull();
+            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "owner");
+            ArtifactViewer.From(User("u1")).Level.Should().BeNull();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
+        }
+    }
 }
 
 /// <summary>The artifact tools over /mcp, without Cosmos DB: the test caller is anonymous, so it has no level.</summary>
