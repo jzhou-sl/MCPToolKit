@@ -5,6 +5,12 @@
 [![MCP Protocol](https://img.shields.io/badge/MCP-1.3.0-blue)](https://spec.modelcontextprotocol.io/)
 [![Azure](https://img.shields.io/badge/Azure-Cosmos%20DB-0078D4?logo=microsoft-azure)](https://azure.microsoft.com/services/cosmos-db/)
 
+> **This fork** serves an artifact's database (Azure Landing Zone Artifacts) instead of the toolkit's own tools.
+> `/mcp` lists only `db_get`, `db_query`, `db_set`, `db_update` and `db_delete` (`src/AzureCosmosDB.MCP.Toolkit/Artifact/`),
+> which apply the artifact's rules (`ARTIFACT_RULES`) to each caller, at a level from their app role
+> (`Cosmos.Read`, `Cosmos.Write`, `Cosmos.Admin`; `ARTIFACT_OWNER_ID` is the owner). The transport is stateless, and
+> `CORS_ALLOWED_ORIGINS` limits browsers to the artifact's site.
+
 A Model Context Protocol (MCP) server that enables AI agents to interact with Azure Cosmos DB through natural language queries. Features enterprise-grade security with Azure Entra ID authentication, document operations, vector search, hybrid search, and schema discovery.
 
 ## 🎯 Why Use This Toolkit?

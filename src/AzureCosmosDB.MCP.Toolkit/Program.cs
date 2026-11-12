@@ -201,10 +201,14 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("MCPPolicy", policy =>
     {
-        policy.AllowAnyOrigin()
-              .AllowAnyMethod()
+        // CORS_ALLOWED_ORIGINS (comma-separated) limits browsers to the artifact's own site; unset, any origin.
+        var origins = (Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (origins.Length > 0) policy.WithOrigins(origins);
+        else policy.AllowAnyOrigin();
+        policy.AllowAnyMethod()
               .AllowAnyHeader()
-              .WithExposedHeaders("Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy");
+              .WithExposedHeaders("Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy", "Mcp-Session-Id");
     });
 });
 
@@ -225,11 +229,14 @@ builder.Services.AddScoped<AzureCosmosDB.MCP.Toolkit.Services.CosmosDbToolsServi
 builder.Services.AddScoped<AzureCosmosDB.MCP.Toolkit.Services.AuthenticationService>();
 builder.Services.AddSingleton<AzureCosmosDB.MCP.Toolkit.Services.McpToolRequestValidator>();
 
-// Register MCP server with SDK transport (SSE + Streamable HTTP) for AI Foundry and other MCP clients.
-// Tools are defined below using [McpServerTool] attributes on CosmosDbMcpTools class.
+// Register MCP server with SDK transport (Streamable HTTP) for the artifact's page and other MCP clients.
+// Stateless: every POST stands alone, so browsers need no Mcp-Session-Id and any replica can answer.
+// Only the artifact database tools (Artifact/ArtifactDbTools.cs) are served at /mcp: the toolkit's own tools
+// read any container directly and would bypass the artifact's rules.
+builder.Services.AddHttpContextAccessor();
 builder.Services.AddMcpServer()
-    .WithHttpTransport()
-    .WithToolsFromAssembly();
+    .WithHttpTransport(options => options.Stateless = true)
+    .WithTools<AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactDbTools>();
 
 // Configure forwarded headers for proxy scenarios
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
@@ -324,7 +331,7 @@ if (isDevelopment || devBypassAuth)
 // Map controllers last
 app.MapControllers();
 
-// Map MCP SDK endpoint at /mcp — provides SSE transport (GET /mcp) and Streamable HTTP (POST /mcp).
+// Map MCP SDK endpoint at /mcp — Streamable HTTP (POST /mcp), stateless.
 // This is what AI Foundry, Claude Desktop, and other standard MCP clients connect to.
 // The custom /mcp/http controller endpoint is retained for the built-in web UI tester.
 if (!devBypassAuth)
