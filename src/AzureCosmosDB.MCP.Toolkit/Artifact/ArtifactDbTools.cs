@@ -16,7 +16,7 @@ namespace AzureCosmosDB.MCP.Toolkit.Artifact;
 [McpServerToolType]
 public sealed class ArtifactDbTools
 {
-    private static readonly ArtifactStore Store = new();
+    private static ArtifactStore Store => ArtifactStore.Shared;
 
     private static readonly Lazy<IReadOnlyList<ArtifactRule>> Rules = new(() =>
         ArtifactRules.Validate(JsonNode.Parse(Environment.GetEnvironmentVariable("ARTIFACT_RULES") ?? "[]")));
@@ -67,7 +67,9 @@ public sealed class ArtifactDbTools
             ArtifactPaths.Document(path);
             var body = ArtifactPaths.CheckBody(ToNode(data));
             DemandWrite(path, viewer);
-            return Snapshot(path, await Store.PutAsync(path, body, viewer.Id, cancellationToken));
+            var record = await Store.PutAsync(path, body, viewer.Id, cancellationToken);
+            Changed(path);
+            return Snapshot(path, record);
         });
 
     [McpServerTool(Name = "db_update")]
@@ -84,6 +86,7 @@ public sealed class ArtifactDbTools
             DemandWrite(path, viewer);
             var record = await Store.UpdateAsync(path, patch, viewer.Id, cancellationToken)
                 ?? throw ArtifactDbException.Invalid("update needs an existing document; use set to create one");
+            Changed(path);
             return Snapshot(path, record);
         });
 
@@ -98,8 +101,12 @@ public sealed class ArtifactDbTools
             ArtifactPaths.Document(path);
             DemandWrite(path, viewer);
             await Store.RemoveAsync(path, cancellationToken);
+            Changed(path);
             return new JsonObject { ["deleted"] = path };
         });
+
+    // Tell this replica's open pages at once (and about deletes, which the change feed doesn't report).
+    private static void Changed(string path) => ArtifactEvents.Shared.Publish(ArtifactPaths.Parent(path));
 
     private static bool Can(string path, string action, ArtifactViewer viewer) =>
         ArtifactRules.CanAccess(Rules.Value, path, action, viewer);

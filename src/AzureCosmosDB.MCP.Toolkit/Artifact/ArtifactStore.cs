@@ -16,6 +16,9 @@ public sealed record ArtifactRecord(string Path, string Id, JsonObject Data, lon
 
 public sealed class ArtifactStore
 {
+    /// <summary>One Cosmos client for the tools and the change feed.</summary>
+    public static ArtifactStore Shared { get; } = new();
+
     private readonly Lazy<Container> _docs = new(() =>
     {
         var endpoint = Environment.GetEnvironmentVariable("COSMOS_ENDPOINT");
@@ -29,7 +32,7 @@ public sealed class ArtifactStore
             Environment.GetEnvironmentVariable("ARTIFACT_CONTAINER") ?? "docs");
     });
 
-    private Container Docs => _docs.Value;
+    internal Container Docs => _docs.Value;
 
     private static string ItemId(string path) => path.Replace('/', '|');
 

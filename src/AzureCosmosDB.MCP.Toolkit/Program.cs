@@ -334,14 +334,16 @@ app.MapControllers();
 if (!devBypassAuth)
 {
     app.MapMcp("/mcp").RequireAuthorization();
+    app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle).RequireAuthorization();
 }
 else
 {
     app.MapMcp("/mcp");
+    app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle);
 }
 
 // No web UI: the toolkit's tester (wwwroot, /api/mcp and /mcp/http) served its own tools without the artifact's
-// rules, /api/mcp without authentication, so it is removed. /mcp and /health remain.
+// rules, /api/mcp without authentication, so it is removed. /mcp, /events and /health remain.
 
 app.Run();
 

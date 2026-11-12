@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using AzureCosmosDB.MCP.Toolkit.Artifact;
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace AzureCosmosDB.MCP.Toolkit.Tests;
@@ -142,6 +143,7 @@ public class ArtifactPathsTests
     }
 }
 
+[Collection("Environment variables")] // these tests set process-wide settings, so they run one at a time
 public class ArtifactViewerTests
 {
     private static ClaimsPrincipal User(string oid, params string[] roles) =>
@@ -245,10 +247,67 @@ public class ArtifactDbToolsMcpTests : IClassFixture<McpTestApplicationFactory>
     }
 
     [Fact]
+    public async Task Events_refuse_callers_without_a_level()
+    {
+        var response = await _client.GetAsync("/events");
+        ((int)response.StatusCode).Should().Be(403);
+    }
+
+    [Fact]
     public async Task Bad_paths_are_invalid_arguments()
     {
         var result = await Call("db_get", new { path = "ideas" });
         result["isError"]!.GetValue<bool>().Should().BeTrue();
         result["content"]![0]!["text"]!.GetValue<string>().Should().StartWith("invalid_argument: a document path");
+    }
+}
+
+[Collection("Environment variables")] // these tests set process-wide settings, so they run one at a time
+public class ArtifactEventsTests
+{
+    [Fact]
+    public async Task Subscribers_hear_published_collections_until_they_leave()
+    {
+        var events = new ArtifactEvents(() => throw new InvalidOperationException("no Cosmos in this test"));
+        using (var subscription = events.Subscribe(readChangeFeed: false))
+        {
+            events.Publish("ideas");
+            (await subscription.Reader.ReadAsync()).Should().Be("ideas");
+            events.SubscriberCount.Should().Be(1);
+        }
+        events.SubscriberCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Events_stream_changes_to_callers_with_a_level()
+    {
+        Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "view");
+        try
+        {
+            var context = new Microsoft.AspNetCore.Http.DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity([new Claim("oid", "u1")], "Bearer")),
+                RequestServices = new ServiceCollection().AddLogging().BuildServiceProvider(),
+            };
+            var body = new MemoryStream();
+            context.Response.Body = body;
+            using var cts = new CancellationTokenSource();
+            context.RequestAborted = cts.Token;
+
+            var handler = ArtifactEventsEndpoint.Handle(context);
+            for (var i = 0; i < 50 && ArtifactEvents.Shared.SubscriberCount == 0; i++) await Task.Delay(20);
+            ArtifactEvents.Shared.Publish("ideas");
+            for (var i = 0; i < 50 && !Encoding.UTF8.GetString(body.ToArray()).Contains("event: change"); i++) await Task.Delay(20);
+            cts.Cancel();
+            await handler;
+
+            context.Response.StatusCode.Should().Be(200);
+            context.Response.ContentType.Should().Be("text/event-stream");
+            Encoding.UTF8.GetString(body.ToArray()).Should().Contain("event: change\ndata: {\"collection\":\"ideas\"}");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
+        }
     }
 }
