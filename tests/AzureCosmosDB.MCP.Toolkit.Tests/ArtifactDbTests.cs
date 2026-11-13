@@ -349,20 +349,30 @@ public class OAuthDiscoveryTests : IClassFixture<AuthEnabledApplicationFactory>
     }
 
     [Fact]
-    public async Task Protected_resource_metadata_names_the_tenant_and_scope()
+    public async Task Authorization_server_metadata_points_at_entra()
     {
-        var response = await _client.GetAsync("/.well-known/oauth-protected-resource");
+        var response = await _client.GetAsync("/.well-known/oauth-authorization-server");
         response.IsSuccessStatusCode.Should().BeTrue();
         var metadata = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
-        metadata["authorization_servers"]!.AsArray().Select(s => s!.GetValue<string>())
-            .Should().Equal($"https://login.microsoftonline.com/{AuthEnabledApplicationFactory.TenantId}/v2.0");
-        metadata["scopes_supported"]!.AsArray().Select(s => s!.GetValue<string>())
+        var entra = $"https://login.microsoftonline.com/{AuthEnabledApplicationFactory.TenantId}";
+        metadata["authorization_endpoint"]!.GetValue<string>().Should().Be($"{entra}/oauth2/v2.0/authorize");
+        metadata["token_endpoint"]!.GetValue<string>().Should().Be($"{entra}/oauth2/v2.0/token");
+        metadata["code_challenge_methods_supported"]!.AsArray().Select(m => m!.GetValue<string>()).Should().Contain("S256");
+        metadata["scopes_supported"]!.AsArray().Select(m => m!.GetValue<string>())
             .Should().Contain($"{AuthEnabledApplicationFactory.ClientId}/.default");
-        metadata["resource"]!.GetValue<string>().Should().EndWith("/mcp");
+        metadata["registration_endpoint"].Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("/.well-known/oauth-protected-resource")]
+    [InlineData("/.well-known/oauth-protected-resource/mcp")]
+    public async Task No_protected_resource_metadata_so_clients_send_no_resource_parameter(string path)
+    {
+        ((int)(await _client.GetAsync(path)).StatusCode).Should().Be(404);
     }
 
     [Fact]
-    public async Task Calls_without_a_token_point_to_the_metadata()
+    public async Task Calls_without_a_token_are_told_the_scope()
     {
         var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
         {
@@ -372,6 +382,8 @@ public class OAuthDiscoveryTests : IClassFixture<AuthEnabledApplicationFactory>
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
         var response = await _client.SendAsync(request);
         ((int)response.StatusCode).Should().Be(401);
-        response.Headers.WwwAuthenticate.ToString().Should().Contain("resource_metadata=").And.Contain("/.well-known/oauth-protected-resource");
+        var challenge = response.Headers.WwwAuthenticate.ToString();
+        challenge.Should().StartWith("Bearer").And.Contain($"scope=\"{AuthEnabledApplicationFactory.ClientId}/.default offline_access\"");
+        challenge.Should().NotContain("resource_metadata");
     }
 }

@@ -13,8 +13,6 @@ using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Text;
 using AzureCosmosDB.MCP.Toolkit.Services;
-using ModelContextProtocol.AspNetCore.Authentication;
-using ModelContextProtocol.Authentication;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -60,15 +58,10 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
         }
     }
     
-    // Add JWT Bearer authentication only if configuration is available. Tokens are validated by JwtBearer; challenges
-    // (401s) go through the MCP SDK's handler, which adds resource_metadata so MCP clients such as Claude can find
-    // the Entra tenant and scope at /.well-known/oauth-protected-resource.
+    // Add JWT Bearer authentication only if configuration is available. MCP clients such as Claude find how to sign
+    // in from /.well-known/oauth-authorization-server (mapped below) and the scope in each 401.
     builder.Services
-        .AddAuthentication(options =>
-        {
-            options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-            options.DefaultChallengeScheme = McpAuthenticationDefaults.AuthenticationScheme;
-        })
+        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         .AddJwtBearer(options =>
         {
             options.Authority = $"https://login.microsoftonline.com/{tenantId}/v2.0";
@@ -168,24 +161,16 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
                     // Never log request headers here: they include the caller's bearer token.
                     var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
                     logger.LogWarning("Authentication challenge: {Error}, {ErrorDescription}", context.Error, context.ErrorDescription);
+
+                    // Tell MCP clients which scope to ask Entra for. No resource_metadata: with it, clients send an
+                    // RFC 8707 resource parameter, which Entra rejects (AADSTS9010010) for a <client ID>/.default scope.
+                    context.HandleResponse();
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    var parameters = new List<string> { $"scope=\"{clientId}/.default offline_access\"" };
+                    if (!string.IsNullOrEmpty(context.Error)) parameters.Add($"error=\"{context.Error}\"");
+                    context.Response.Headers.WWWAuthenticate = "Bearer " + string.Join(", ", parameters);
                     return Task.CompletedTask;
                 }
-            };
-        })
-        .AddMcp(options =>
-        {
-            options.ResourceMetadata = new ProtectedResourceMetadata
-            {
-                AuthorizationServers = { $"https://login.microsoftonline.com/{tenantId}/v2.0" },
-                ScopesSupported = [$"{clientId}/.default", "offline_access"],
-                ResourceName = "Artifact database",
-            };
-            // The resource is this server's public /mcp URL (UseForwardedHeaders makes the scheme https behind ingress).
-            options.Events.OnResourceMetadataRequest = context =>
-            {
-                var request = context.HttpContext.Request;
-                context.ResourceMetadata!.Resource = $"{request.Scheme}://{request.Host}/mcp";
-                return Task.CompletedTask;
             };
         });
 
@@ -351,6 +336,25 @@ app.MapControllers();
 // The custom /mcp/http controller endpoint is retained for the built-in web UI tester.
 if (!devBypassAuth)
 {
+    if (!string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId))
+    {
+        // OAuth authorization server metadata (RFC 8414) at this server's root, pointing at Entra. MCP clients that
+        // find no protected resource metadata fall back to this, and then sign in with Entra without a resource
+        // parameter. There's no registration endpoint: clients use a pre-registered client ID (and secret).
+        var entra = $"https://login.microsoftonline.com/{tenantId}";
+        app.MapGet("/.well-known/oauth-authorization-server", () => Results.Json(new Dictionary<string, object>
+        {
+            ["issuer"] = $"{entra}/v2.0",
+            ["authorization_endpoint"] = $"{entra}/oauth2/v2.0/authorize",
+            ["token_endpoint"] = $"{entra}/oauth2/v2.0/token",
+            ["jwks_uri"] = $"{entra}/discovery/v2.0/keys",
+            ["response_types_supported"] = new[] { "code" },
+            ["grant_types_supported"] = new[] { "authorization_code", "refresh_token" },
+            ["code_challenge_methods_supported"] = new[] { "S256" },
+            ["token_endpoint_auth_methods_supported"] = new[] { "client_secret_post", "client_secret_basic" },
+            ["scopes_supported"] = new[] { $"{clientId}/.default", "offline_access", "openid", "profile" },
+        }));
+    }
     app.MapMcp("/mcp").RequireAuthorization();
     app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle).RequireAuthorization();
 }
