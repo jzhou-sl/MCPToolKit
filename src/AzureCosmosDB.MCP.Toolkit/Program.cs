@@ -13,6 +13,8 @@ using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Text;
 using AzureCosmosDB.MCP.Toolkit.Services;
+using ModelContextProtocol.AspNetCore.Authentication;
+using ModelContextProtocol.Authentication;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -58,9 +60,15 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
         }
     }
     
-    // Add JWT Bearer authentication only if configuration is available
+    // Add JWT Bearer authentication only if configuration is available. Tokens are validated by JwtBearer; challenges
+    // (401s) go through the MCP SDK's handler, which adds resource_metadata so MCP clients such as Claude can find
+    // the Entra tenant and scope at /.well-known/oauth-protected-resource.
     builder.Services
-        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddAuthentication(options =>
+        {
+            options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+            options.DefaultChallengeScheme = McpAuthenticationDefaults.AuthenticationScheme;
+        })
         .AddJwtBearer(options =>
         {
             options.Authority = $"https://login.microsoftonline.com/{tenantId}/v2.0";
@@ -157,17 +165,27 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
                 },
                 OnChallenge = context =>
                 {
+                    // Never log request headers here: they include the caller's bearer token.
                     var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
                     logger.LogWarning("Authentication challenge: {Error}, {ErrorDescription}", context.Error, context.ErrorDescription);
-                    
-                    // Log ALL headers to debug
-                    logger.LogWarning("All request headers:");
-                    foreach (var header in context.Request.Headers)
-                    {
-                        logger.LogWarning("  {Key}: {Value}", header.Key, header.Value);
-                    }
                     return Task.CompletedTask;
                 }
+            };
+        })
+        .AddMcp(options =>
+        {
+            options.ResourceMetadata = new ProtectedResourceMetadata
+            {
+                AuthorizationServers = { $"https://login.microsoftonline.com/{tenantId}/v2.0" },
+                ScopesSupported = [$"{clientId}/.default", "offline_access"],
+                ResourceName = "Artifact database",
+            };
+            // The resource is this server's public /mcp URL (UseForwardedHeaders makes the scheme https behind ingress).
+            options.Events.OnResourceMetadataRequest = context =>
+            {
+                var request = context.HttpContext.Request;
+                context.ResourceMetadata!.Resource = $"{request.Scheme}://{request.Host}/mcp";
+                return Task.CompletedTask;
             };
         });
 

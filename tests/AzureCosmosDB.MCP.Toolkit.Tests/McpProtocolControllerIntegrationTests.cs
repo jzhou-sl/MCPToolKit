@@ -8,6 +8,7 @@ using Xunit;
 
 namespace AzureCosmosDB.MCP.Toolkit.Tests;
 
+[Collection("Environment variables")]
 public class McpProtocolControllerIntegrationTests : IClassFixture<McpTestApplicationFactory>
 {
     private readonly HttpClient _client;

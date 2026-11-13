@@ -181,6 +181,7 @@ public class ArtifactViewerTests
 }
 
 /// <summary>The artifact tools over /mcp, without Cosmos DB: the test caller is anonymous, so it has no level.</summary>
+[Collection("Environment variables")]
 public class ArtifactDbToolsMcpTests : IClassFixture<McpTestApplicationFactory>
 {
     private readonly HttpClient _client;
@@ -309,5 +310,68 @@ public class ArtifactEventsTests
         {
             Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
         }
+    }
+}
+
+/// <summary>The server with Entra authentication on, as deployed: how MCP clients such as Claude discover sign-in.</summary>
+public sealed class AuthEnabledApplicationFactory : Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program>
+{
+    public const string TenantId = "11111111-1111-1111-1111-111111111111";
+    public const string ClientId = "22222222-2222-2222-2222-222222222222";
+
+    // Program.cs reads these as it starts, before ConfigureWebHost runs, so set them when the factory is created.
+    public AuthEnabledApplicationFactory()
+    {
+        Environment.SetEnvironmentVariable("DEV_BYPASS_AUTH", "false");
+        Environment.SetEnvironmentVariable("DevelopmentMode__BypassAuthentication", "false"); // overrides appsettings.Development.json
+        Environment.SetEnvironmentVariable("AzureAd__TenantId", TenantId);
+        Environment.SetEnvironmentVariable("AzureAd__ClientId", ClientId);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        Environment.SetEnvironmentVariable("AzureAd__TenantId", null);
+        Environment.SetEnvironmentVariable("AzureAd__ClientId", null);
+        Environment.SetEnvironmentVariable("DevelopmentMode__BypassAuthentication", null);
+        Environment.SetEnvironmentVariable("DEV_BYPASS_AUTH", "true");
+        base.Dispose(disposing);
+    }
+}
+
+[Collection("Environment variables")]
+public class OAuthDiscoveryTests : IClassFixture<AuthEnabledApplicationFactory>
+{
+    private readonly HttpClient _client;
+
+    public OAuthDiscoveryTests(AuthEnabledApplicationFactory factory)
+    {
+        _client = factory.CreateClient();
+    }
+
+    [Fact]
+    public async Task Protected_resource_metadata_names_the_tenant_and_scope()
+    {
+        var response = await _client.GetAsync("/.well-known/oauth-protected-resource");
+        response.IsSuccessStatusCode.Should().BeTrue();
+        var metadata = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+        metadata["authorization_servers"]!.AsArray().Select(s => s!.GetValue<string>())
+            .Should().Equal($"https://login.microsoftonline.com/{AuthEnabledApplicationFactory.TenantId}/v2.0");
+        metadata["scopes_supported"]!.AsArray().Select(s => s!.GetValue<string>())
+            .Should().Contain($"{AuthEnabledApplicationFactory.ClientId}/.default");
+        metadata["resource"]!.GetValue<string>().Should().EndWith("/mcp");
+    }
+
+    [Fact]
+    public async Task Calls_without_a_token_point_to_the_metadata()
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
+        {
+            Content = new StringContent("""{"jsonrpc":"2.0","id":1,"method":"tools/list"}""", Encoding.UTF8, "application/json"),
+        };
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+        var response = await _client.SendAsync(request);
+        ((int)response.StatusCode).Should().Be(401);
+        response.Headers.WwwAuthenticate.ToString().Should().Contain("resource_metadata=").And.Contain("/.well-known/oauth-protected-resource");
     }
 }
