@@ -203,8 +203,15 @@ else
 // short-lived ticket signed with TICKET_SECRET (Artifact/TicketAuthentication.cs). The page sends it as a bearer
 // token, like Claude's Entra tokens; tickets have two dot-separated parts and JWTs three, which picks the scheme.
 // Tickets work without the MCP server API registration above, which only Claude needs.
+//
+// With COSMOS_TOKEN_PASSTHROUGH on (test only), Claude Code can instead send the person's own Cosmos DB token from the
+// Azure CLI as its bearer token, with no app registration (docs/cosmos-token-passthrough.md, "Claude Code"). That
+// token then says who is calling, so the "CosmosToken" scheme verifies it against Entra: signature, this tenant as
+// issuer, a Cosmos DB audience, lifetime. A bearer goes there when its aud is Cosmos DB.
 var jwtConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId);
-builder.Services
+var cosmosBearerConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId)
+    && AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.Enabled;
+var authentication = builder.Services
     .AddAuthentication(options =>
     {
         options.DefaultScheme = "Artifact";
@@ -212,11 +219,41 @@ builder.Services
     })
     .AddScheme<AuthenticationSchemeOptions, AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler>(
         AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.SchemeName, null)
-    .AddPolicyScheme("Artifact", "Ticket or Entra token", options =>
+    .AddPolicyScheme("Artifact", "Ticket, Cosmos DB token or Entra token", options =>
         options.ForwardDefaultSelector = context =>
-            AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.HasTicket(context.Request) || !jwtConfigured
+            AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.HasTicket(context.Request)
                 ? AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.SchemeName
-                : JwtBearerDefaults.AuthenticationScheme);
+            : cosmosBearerConfigured && AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.IsCosmosBearer(context.Request)
+                ? AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.SchemeName
+            : jwtConfigured
+                ? JwtBearerDefaults.AuthenticationScheme
+                : AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.SchemeName);
+if (cosmosBearerConfigured)
+{
+    authentication.AddJwtBearer(AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.SchemeName, options =>
+    {
+        options.Authority = $"https://login.microsoftonline.com/{tenantId}/v2.0"; // signing keys; v1 tokens share them
+        options.MapInboundClaims = false;
+        options.RefreshOnIssuerKeyNotFound = true;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            // Azure CLI tokens asked for with --resource are v1 (sts.windows.net); allow v2 too. This tenant only.
+            ValidIssuers = [$"https://sts.windows.net/{tenantId}/", $"https://login.microsoftonline.com/{tenantId}/v2.0"],
+            ValidateAudience = true,
+            // Cosmos DB's audiences, as CosmosTokenPassthrough accepts them. The aud can be the account endpoint with ":443" and a trailing "/"; compare it as Audiences() lists it.
+            AudienceValidator = (audiences, _, _) =>
+            {
+                var valid = AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.Audiences();
+                return audiences.Any(a => valid.Contains(a.Trim().TrimEnd('/').Replace(":443", "", StringComparison.Ordinal)));
+            },
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ClockSkew = TimeSpan.FromSeconds(30),
+            NameClaimType = "upn",
+        };
+    });
+}
 
 // Add HTTP context accessor for authentication
 builder.Services.AddHttpContextAccessor();

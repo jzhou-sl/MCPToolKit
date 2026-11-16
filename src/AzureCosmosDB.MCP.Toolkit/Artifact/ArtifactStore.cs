@@ -8,7 +8,8 @@
 // allowed in path segments). Items: {id, path, collection, docId, data, version, updatedAt, updatedBy}.
 //
 // Which identity reaches Cosmos DB: the server's managed identity (Shared), or with COSMOS_TOKEN_PASSTHROUGH on, the
-// caller's own Cosmos DB token (For, CosmosTokenPassthrough.cs), so Cosmos DB refuses what they may not do. Its
+// caller's own Cosmos DB token (For, CosmosTokenPassthrough.cs): the X-Cosmos-Token header, or for Claude Code the
+// bearer token itself once the CosmosToken scheme has verified it. So Cosmos DB refuses what they may not do. Its
 // refusals are permission_denied (403) and unauthenticated (401).
 using System.Net;
 using System.Text;
@@ -32,6 +33,7 @@ public sealed class ArtifactStore
     {
         if (!CosmosTokenPassthrough.Enabled) return Shared;
         var token = context?.Request.Headers[CosmosTokenPassthrough.Header].ToString().Trim();
+        if (string.IsNullOrEmpty(token)) token = CosmosTokenPassthrough.VerifiedBearer(context);
         var now = DateTimeOffset.UtcNow;
         var claims = CosmosTokenPassthrough.Check(token, viewer.Email, now);
         return CosmosTokenPassthrough.StoreFor(token!, claims.Expires, now);

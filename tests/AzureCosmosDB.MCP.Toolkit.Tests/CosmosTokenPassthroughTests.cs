@@ -96,6 +96,30 @@ public class CosmosTokenPassthroughTests
     public void A_caller_who_isnt_signed_in_is_refused() => WithTenant(() =>
         Checking(Token(), email: null).Should().Throw<ArtifactDbException>().Where(e => e.Code == "unauthenticated"));
 
+    private static bool IsCosmosBearer(string? authorization)
+    {
+        var context = new Microsoft.AspNetCore.Http.DefaultHttpContext();
+        if (authorization is not null) context.Request.Headers.Authorization = authorization;
+        return CosmosTokenPassthrough.IsCosmosBearer(context.Request);
+    }
+
+    // Claude Code sends the Cosmos DB token as its bearer token; such requests go to the CosmosToken scheme.
+    [Fact]
+    public void A_cosmos_db_bearer_token_is_recognised_only_with_passthrough_on()
+    {
+        WithSettings(new() { ["COSMOS_TOKEN_PASSTHROUGH"] = "true", ["COSMOS_ENDPOINT"] = Endpoint }, () =>
+        {
+            IsCosmosBearer("Bearer " + Token()).Should().BeTrue();
+            IsCosmosBearer("Bearer " + Token(aud: "https://cosmos-alz-test.documents.azure.com:443/")).Should().BeTrue();
+            IsCosmosBearer("Bearer " + Token(aud: "api://mcp-server")).Should().BeFalse();
+            IsCosmosBearer("Bearer eyJzdWIiOiJ4In0.c2ln").Should().BeFalse(); // a ticket: two parts
+            IsCosmosBearer("Bearer not.a.jwt").Should().BeFalse();
+            IsCosmosBearer(null).Should().BeFalse();
+        });
+        WithSettings(new() { ["COSMOS_ENDPOINT"] = Endpoint }, () =>
+            IsCosmosBearer("Bearer " + Token()).Should().BeFalse());
+    }
+
     [Fact]
     public void Top_level_collections_named_in_artifact_containers_have_their_own() =>
         WithSettings(new() { ["ARTIFACT_CONTAINERS"] = """["votes", "finance"]""" }, () =>

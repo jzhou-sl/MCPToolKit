@@ -14,6 +14,12 @@
 //   - One CosmosClient per token (keyed by its SHA-256), dropped once the token expires: a client is expensive to make.
 //   - There is no fallback to the server's managed identity, which only reads the change feed for /events.
 // The token is never logged.
+//
+// Claude Code (no app registration yet): with passthrough on, a caller may send the Cosmos DB token itself as
+// "Authorization: Bearer <token>" instead of a ticket. Then it also says who is calling, so it is NOT taken on trust:
+// Program.cs routes such a bearer (IsCosmosBearer) to the "CosmosToken" JwtBearer scheme, which checks its signature,
+// issuer (this tenant) and audience (Audiences) against Entra. ArtifactStore.For then uses that bearer as the Cosmos
+// DB token when there's no X-Cosmos-Token header. See docs/cosmos-token-passthrough.md, "Claude Code".
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
@@ -27,6 +33,7 @@ namespace AzureCosmosDB.MCP.Toolkit.Artifact;
 public static class CosmosTokenPassthrough
 {
     public const string Header = "X-Cosmos-Token";
+    public const string SchemeName = "CosmosToken";
     private const int MaxTokenLength = 16 * 1024;
     private static readonly TimeSpan ClockSkew = TimeSpan.FromSeconds(30);
     private static readonly string[] EmailClaims = ["upn", "preferred_username", "unique_name", "email"];
@@ -83,12 +90,47 @@ public static class CosmosTokenPassthrough
     // is https://<account>.documents.azure.com:443/).
     private const string CosmosDbAppId = "a232010e-820c-4083-83bb-3ace5fc29d0b";
 
-    private static HashSet<string> Audiences()
+    /// <summary>The aud values a Cosmos DB token for this account can carry.</summary>
+    public static HashSet<string> Audiences()
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { CosmosDbAppId, "https://cosmos.azure.com" };
         if (Uri.TryCreate(Environment.GetEnvironmentVariable("COSMOS_ENDPOINT"), UriKind.Absolute, out var endpoint))
             set.Add($"https://{endpoint.Host}");
         return set;
+    }
+
+    /// <summary>
+    /// Whether, with passthrough on, the bearer token is a JWT whose (unverified) aud is Cosmos DB: the request is then
+    /// for the CosmosToken scheme, which verifies it. Tickets have two parts, so they never match.
+    /// </summary>
+    public static bool IsCosmosBearer(HttpRequest request)
+    {
+        if (!Enabled) return false;
+        var header = request.Headers.Authorization.ToString();
+        if (!header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return false;
+        var token = header[7..].Trim();
+        if (token.Length > MaxTokenLength) return false;
+        var parts = token.Split('.');
+        if (parts.Length != 3) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(WebEncoders.Base64UrlDecode(parts[1]));
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("aud", out var aud) && aud.ValueKind == JsonValueKind.String
+                && Audiences().Contains(Normalize(aud.GetString()));
+        }
+        catch (Exception e) when (e is FormatException or JsonException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>The bearer token, when the CosmosToken scheme authenticated this request; otherwise null.</summary>
+    public static string? VerifiedBearer(HttpContext? context)
+    {
+        if (context?.User.Identity is not { IsAuthenticated: true, AuthenticationType: SchemeName }) return null;
+        var header = context.Request.Headers.Authorization.ToString();
+        return header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? header[7..].Trim() : null;
     }
 
     private static string Normalize(string? aud) =>
