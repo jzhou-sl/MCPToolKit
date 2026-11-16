@@ -23,11 +23,12 @@ builder.Services.AddControllers();
 // Disable default claim mapping for cleaner token handling
 JwtSecurityTokenHandler.DefaultMapInboundClaims = false;
 
-// Configure for container environment
+// Azure Functions runs this server as a custom handler (host.json) and tells it which port to serve on in
+// FUNCTIONS_CUSTOMHANDLER_PORT; in a container or locally it serves 8080.
 builder.WebHost.ConfigureKestrel(options =>
 {
-    // Container Apps expects port 8080
-    options.ListenAnyIP(8080);
+    var port = int.TryParse(Environment.GetEnvironmentVariable("FUNCTIONS_CUSTOMHANDLER_PORT"), out var p) ? p : 8080;
+    options.ListenAnyIP(port);
 });
 
 // Get Azure AD configuration from appsettings

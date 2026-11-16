@@ -120,7 +120,8 @@ public static class ArtifactEventsEndpoint
 {
     private static readonly TimeSpan Heartbeat = TimeSpan.FromSeconds(25); // under the ingress idle timeout
     // Streams end after this, and the page reconnects: a ticket lasts a minute, so the caller's access is checked again.
-    private static readonly TimeSpan MaxStream = TimeSpan.FromMinutes(10);
+    // Under Azure Functions' 230-second limit on an HTTP response, so the stream ends cleanly before the platform cuts it.
+    private static readonly TimeSpan MaxStream = TimeSpan.FromSeconds(200);
 
     /// <summary>GET /events: server-sent events, one "change" per changed collection, for callers with a level.</summary>
     public static async Task Handle(HttpContext context)

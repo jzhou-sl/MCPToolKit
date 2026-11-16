@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
@@ -20,6 +20,7 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RootNamespace>AzureCosmosDB.MCP.Toolkit</RootNamespace>
     <AssemblyName>AzureCosmosDB.MCP.Toolkit</AssemblyName>
+    <UserSecretsId>00246217-3736-4a08-a2ad-459202f29160</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>
@@ -34,6 +35,13 @@
     <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.18.0" />
     <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="8.18.0" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.18.0" />
+  </ItemGroup>
+
+  <!-- host.json makes the published app an Azure Functions custom handler: Functions (Flex Consumption) starts
+       "dotnet AzureCosmosDB.MCP.Toolkit.dll" and forwards every request to it, with no /api prefix and no function
+       keys (the server checks tickets and Entra tokens itself). Ignored when run in a container or locally. -->
+  <ItemGroup>
+    <Content Update="host.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
