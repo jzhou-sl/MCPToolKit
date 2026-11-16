@@ -6,6 +6,7 @@ using System.Text.Json;
 using Azure.Identity;
 using System.Text.RegularExpressions;
 using Azure.AI.OpenAI;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.HttpOverrides;
@@ -196,6 +197,17 @@ else
     });
 }
 
+// People using the artifact's page come through its Static Web App, on /api/* only, identified by the
+// x-ms-client-principal header it adds (Artifact/StaticWebAppsAuthentication.cs). This works without the MCP server
+// API registration above, which only Claude needs.
+builder.Services.AddAuthentication()
+    .AddScheme<AuthenticationSchemeOptions, AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler>(
+        AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.SchemeName, null);
+builder.Services.AddAuthorization(options =>
+    options.AddPolicy(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PolicyName, p => p
+        .AddAuthenticationSchemes(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.SchemeName)
+        .RequireAuthenticatedUser()));
+
 // Add HTTP context accessor for authentication
 builder.Services.AddHttpContextAccessor();
 
@@ -357,12 +369,22 @@ if (!devBypassAuth)
     }
     app.MapMcp("/mcp").RequireAuthorization();
     app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle).RequireAuthorization();
+    app.MapGet("/me", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactViewer.Me).RequireAuthorization();
 }
 else
 {
     app.MapMcp("/mcp");
     app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle);
+    app.MapGet("/me", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactViewer.Me);
 }
+
+// The artifact's page, through its Static Web App (which proxies /api/* here, path kept). No /api/events: the Static
+// Web App ends every proxied request after 45 seconds, so the page polls instead.
+app.MapMcp(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PathPrefix + "/mcp")
+    .RequireAuthorization(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PolicyName);
+app.MapGet(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PathPrefix + "/me",
+        AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactViewer.Me)
+    .RequireAuthorization(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PolicyName);
 
 // No web UI: the toolkit's tester (wwwroot, /api/mcp and /mcp/http) served its own tools without the artifact's
 // rules, /api/mcp without authentication, so it is removed. /mcp, /events and /health remain.

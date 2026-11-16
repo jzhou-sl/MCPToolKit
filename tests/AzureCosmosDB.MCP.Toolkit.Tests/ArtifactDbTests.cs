@@ -387,3 +387,119 @@ public class OAuthDiscoveryTests : IClassFixture<AuthEnabledApplicationFactory>
         challenge.Should().NotContain("resource_metadata");
     }
 }
+
+/// <summary>People coming through the artifact's Static Web App, identified by its x-ms-client-principal header.</summary>
+[Collection("Environment variables")]
+public class StaticWebAppsAuthenticationTests : IClassFixture<AuthEnabledApplicationFactory>
+{
+    private readonly HttpClient _client;
+
+    public StaticWebAppsAuthenticationTests(AuthEnabledApplicationFactory factory)
+    {
+        _client = factory.CreateClient();
+    }
+
+    private static string Principal(string provider, string details) =>
+        Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+        {
+            identityProvider = provider, userId = "swa-123", userDetails = details, userRoles = new[] { "anonymous", "authenticated" },
+        })));
+
+    private static ArtifactViewer Viewer(string provider, string details) =>
+        ArtifactViewer.From(StaticWebAppsAuthenticationHandler.Parse(Principal(provider, details)));
+
+    private static void WithSettings(Dictionary<string, string?> settings, Action test)
+    {
+        foreach (var (k, v) in settings) Environment.SetEnvironmentVariable(k, v);
+        try { test(); }
+        finally { foreach (var k in settings.Keys) Environment.SetEnvironmentVariable(k, null); }
+    }
+
+    [Fact]
+    public void Only_entra_sign_ins_with_an_email_are_accepted()
+    {
+        StaticWebAppsAuthenticationHandler.Parse(Principal("aad", "Jane.Doe@Example.com"))!
+            .FindFirst("email")!.Value.Should().Be("jane.doe@example.com");
+        StaticWebAppsAuthenticationHandler.Parse(Principal("github", "jane@example.com")).Should().BeNull();
+        StaticWebAppsAuthenticationHandler.Parse(Principal("aad", "janedoe")).Should().BeNull();
+        StaticWebAppsAuthenticationHandler.Parse("not base64!").Should().BeNull();
+        StaticWebAppsAuthenticationHandler.Parse(Convert.ToBase64String(Encoding.UTF8.GetBytes("[]"))).Should().BeNull();
+    }
+
+    [Fact]
+    public void Levels_come_from_the_owner_email_and_the_access_list() => WithSettings(new()
+    {
+        ["ARTIFACT_OWNER_EMAIL"] = "Owner@Example.com",
+        ["ARTIFACT_ACCESS"] = """{"editors":["ed@example.com"],"contributors":["Con@Example.com"],"viewers":["vi@other.org"]}""",
+    }, () =>
+    {
+        var owner = Viewer("aad", "owner@example.com");
+        owner.Level.Should().Be("owner");
+        owner.Id.Should().Be("owner@example.com");
+        owner.Name.Should().Be("Owner");
+        Viewer("aad", "ed@example.com").Level.Should().Be("admin");
+        Viewer("aad", "con@example.com").Level.Should().Be("interact");
+        Viewer("aad", "vi@other.org").Level.Should().Be("view");
+        Viewer("aad", "someone@example.com").Level.Should().BeNull();
+    });
+
+    [Fact]
+    public void The_default_level_is_only_for_allowed_domains() => WithSettings(new()
+    {
+        ["ARTIFACT_DEFAULT_LEVEL"] = "interact",
+        ["ARTIFACT_EMAIL_DOMAINS"] = "example.com, example.co.uk",
+    }, () =>
+    {
+        Viewer("aad", "jane.doe@example.com").Level.Should().Be("interact");
+        Viewer("aad", "jane.doe@example.com").Name.Should().Be("Jane Doe");
+        Viewer("aad", "j@example.co.uk").Level.Should().Be("interact");
+        Viewer("aad", "j@gmail.com").Level.Should().BeNull();
+        Viewer("aad", "j@notexample.com").Level.Should().BeNull();
+    });
+
+    [Fact]
+    public void Entra_tokens_are_identified_by_email_too() => WithSettings(new()
+    {
+        ["ARTIFACT_ACCESS"] = """{"contributors":["jane@example.com"]}""",
+    }, () =>
+    {
+        var user = new ClaimsPrincipal(new ClaimsIdentity(
+            [new Claim("oid", "u1"), new Claim("preferred_username", "Jane@Example.com"), new Claim("name", "Jane")], "Bearer"));
+        var viewer = ArtifactViewer.From(user);
+        viewer.Id.Should().Be("jane@example.com");
+        viewer.Level.Should().Be("interact");
+        viewer.Name.Should().Be("Jane");
+    });
+
+    private async Task<HttpResponseMessage> Get(string path, string? principal)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, path);
+        if (principal is not null) request.Headers.Add("x-ms-client-principal", principal);
+        return await _client.SendAsync(request);
+    }
+
+    [Fact]
+    public async Task Api_me_answers_for_the_person_in_the_header() => await WithSettingsAsync(async () =>
+    {
+        var response = await Get("/api/me", Principal("aad", "owner@example.com"));
+        response.IsSuccessStatusCode.Should().BeTrue();
+        var me = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+        me["id"]!.GetValue<string>().Should().Be("owner@example.com");
+        me["level"]!.GetValue<string>().Should().Be("owner");
+    });
+
+    [Fact]
+    public async Task The_header_is_trusted_on_api_paths_only() => await WithSettingsAsync(async () =>
+    {
+        ((int)(await Get("/api/me", null)).StatusCode).Should().Be(401);
+        ((int)(await Get("/me", Principal("aad", "owner@example.com"))).StatusCode).Should().Be(401);
+        ((int)(await Get("/events", Principal("aad", "owner@example.com"))).StatusCode).Should().Be(401);
+    });
+
+    private static async Task WithSettingsAsync(Func<Task> test)
+    {
+        Environment.SetEnvironmentVariable("ARTIFACT_OWNER_EMAIL", "owner@example.com");
+        try { await test(); }
+        finally { Environment.SetEnvironmentVariable("ARTIFACT_OWNER_EMAIL", null); }
+    }
+}
