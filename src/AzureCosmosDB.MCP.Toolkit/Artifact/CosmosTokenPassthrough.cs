@@ -8,7 +8,8 @@
 //   - The page sends the token in the X-Cosmos-Token header next to its ticket, which still says who is signed in.
 //   - The token's signature isn't checked here: Cosmos DB checks it on every call. This only refuses tokens that
 //     can't be the caller's own: tid must be this tenant (AzureAd__TenantId), exp in the future, aud Cosmos DB
-//     (https://cosmos.azure.com or this account's endpoint, COSMOS_ENDPOINT), and its upn, preferred_username,
+//     (its application ID, as Azure CLI tokens have it, or https://cosmos.azure.com or this account's endpoint,
+//     COSMOS_ENDPOINT), and its upn, preferred_username,
 //     unique_name or email the caller's sign-in email, so updatedBy stays honest.
 //   - One CosmosClient per token (keyed by its SHA-256), dropped once the token expires: a client is expensive to make.
 //   - There is no fallback to the server's managed identity, which only reads the change feed for /events.
@@ -77,10 +78,14 @@ public static class CosmosTokenPassthrough
         return new TokenClaims(me, expires);
     }
 
-    // https://cosmos.azure.com, and the account's own endpoint (COSMOS_ENDPOINT is https://<account>.documents.azure.com:443/).
+    // Azure Cosmos DB's application ID, which is what Entra puts in aud for the Azure CLI's tokens whichever resource
+    // URL was asked for; and the URL forms: https://cosmos.azure.com and the account's own endpoint (COSMOS_ENDPOINT
+    // is https://<account>.documents.azure.com:443/).
+    private const string CosmosDbAppId = "a232010e-820c-4083-83bb-3ace5fc29d0b";
+
     private static HashSet<string> Audiences()
     {
-        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "https://cosmos.azure.com" };
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { CosmosDbAppId, "https://cosmos.azure.com" };
         if (Uri.TryCreate(Environment.GetEnvironmentVariable("COSMOS_ENDPOINT"), UriKind.Absolute, out var endpoint))
             set.Add($"https://{endpoint.Host}");
         return set;

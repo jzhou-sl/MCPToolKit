@@ -18,9 +18,10 @@ public class CosmosTokenPassthroughTests
     private const string Endpoint = "https://cosmos-alz-test.documents.azure.com:443/";
     private static readonly DateTimeOffset Now = DateTimeOffset.UtcNow;
 
-    // What az account get-access-token gives, unsigned: Cosmos DB checks signatures, the server doesn't.
+    // What az account get-access-token --resource <account endpoint> gives (its aud is Cosmos DB's application ID),
+    // unsigned: Cosmos DB checks signatures, the server doesn't.
     private static string Token(
-        string upn = "jane.doe@example.com", string tid = Tenant, string aud = "https://cosmos.azure.com", int expiresIn = 3600)
+        string upn = "jane.doe@example.com", string tid = Tenant, string aud = "a232010e-820c-4083-83bb-3ace5fc29d0b", int expiresIn = 3600)
     {
         string Part(object o) => WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(o)));
         return Part(new { alg = "RS256", typ = "JWT" }) + "." +
@@ -52,7 +53,9 @@ public class CosmosTokenPassthroughTests
         var claims = CosmosTokenPassthrough.Check(Token(), "Jane.Doe@example.com", Now);
         claims.Email.Should().Be("jane.doe@example.com");
         claims.Expires.Should().BeCloseTo(Now.AddHours(1), TimeSpan.FromSeconds(2));
-        // The account's own endpoint is a Cosmos DB audience too, with or without the port and slash.
+        // The URL forms are Cosmos DB audiences too: https://cosmos.azure.com, and the account's own endpoint with or
+        // without the port and slash.
+        CosmosTokenPassthrough.Check(Token(aud: "https://cosmos.azure.com/"), "jane.doe@example.com", Now).Should().NotBeNull();
         CosmosTokenPassthrough.Check(Token(aud: "https://cosmos-alz-test.documents.azure.com"), "jane.doe@example.com", Now)
             .Should().NotBeNull();
         CosmosTokenPassthrough.Check(Token(aud: Endpoint), "jane.doe@example.com", Now).Should().NotBeNull();
