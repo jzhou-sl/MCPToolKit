@@ -3,11 +3,16 @@
 // caller (ArtifactViewer). A document the caller may not read looks absent; a write they may not make fails
 // with invalid_argument, as the Claude artifact `db` contract says.
 //
+// With COSMOS_TOKEN_PASSTHROUGH on (test only, CosmosTokenPassthrough.cs) the rules are off: each call reaches
+// Cosmos DB with the caller's own token, and Cosmos DB's role assignments alone decide. What it refuses fails with
+// permission_denied; a missing, expired or someone else's token fails with unauthenticated before Cosmos DB is called.
+//
 // Results: a snapshot is {id, path, exists, data?, version?, updatedAt?}; db_query returns {items: [snapshot]}.
 // Errors are tool results with isError and the text "<code>: <message>".
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Microsoft.Azure.Cosmos;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
@@ -16,8 +21,6 @@ namespace AzureCosmosDB.MCP.Toolkit.Artifact;
 [McpServerToolType]
 public sealed class ArtifactDbTools
 {
-    private static ArtifactStore Store => ArtifactStore.Shared;
-
     private static readonly Lazy<IReadOnlyList<ArtifactRule>> Rules = new(() =>
         ArtifactRules.Validate(JsonNode.Parse(Environment.GetEnvironmentVariable("ARTIFACT_RULES") ?? "[]")));
 
@@ -29,10 +32,10 @@ public sealed class ArtifactDbTools
         IHttpContextAccessor http, ILogger<ArtifactDbTools> logger,
         [Description(PathDescription)] string path,
         CancellationToken cancellationToken) =>
-        Run(http, logger, async viewer =>
+        Run(http, logger, async (viewer, store) =>
         {
             ArtifactPaths.Document(path);
-            var record = Can(path, "read", viewer) ? await Store.GetAsync(path, cancellationToken) : null;
+            var record = Can(path, "read", viewer) ? await store.GetAsync(path, cancellationToken) : null;
             return Snapshot(path, record);
         });
 
@@ -45,11 +48,11 @@ public sealed class ArtifactDbTools
         [Description("Order: {field, dir: asc | desc}")] JsonElement? orderBy = null,
         [Description("At most this many documents, 1 to 1000")] int? limit = null,
         CancellationToken cancellationToken = default) =>
-        Run(http, logger, async viewer =>
+        Run(http, logger, async (viewer, store) =>
         {
             ArtifactPaths.Collection(collection);
             var query = ArtifactQuery.Check(ToNode(where), ToNode(orderBy), limit);
-            var readable = (await Store.ListAsync(collection, cancellationToken)).Where(r => Can(r.Path, "read", viewer));
+            var readable = (await store.ListAsync(collection, cancellationToken)).Where(r => Can(r.Path, "read", viewer));
             var items = new JsonArray();
             foreach (var r in ArtifactQuery.Run(readable, query)) items.Add(Snapshot(r.Path, r));
             return new JsonObject { ["items"] = items };
@@ -62,12 +65,12 @@ public sealed class ArtifactDbTools
         [Description(PathDescription)] string path,
         [Description("Document body: a JSON object")] JsonElement data,
         CancellationToken cancellationToken) =>
-        Run(http, logger, async viewer =>
+        Run(http, logger, async (viewer, store) =>
         {
             ArtifactPaths.Document(path);
             var body = ArtifactPaths.CheckBody(ToNode(data));
             DemandWrite(path, viewer);
-            var record = await Store.PutAsync(path, body, viewer.Id, cancellationToken);
+            var record = await store.PutAsync(path, body, viewer.Id, cancellationToken);
             Changed(path);
             return Snapshot(path, record);
         });
@@ -79,12 +82,12 @@ public sealed class ArtifactDbTools
         [Description(PathDescription)] string path,
         [Description("Fields to merge: a JSON object")] JsonElement data,
         CancellationToken cancellationToken) =>
-        Run(http, logger, async viewer =>
+        Run(http, logger, async (viewer, store) =>
         {
             ArtifactPaths.Document(path);
             var patch = ArtifactPaths.CheckBody(ToNode(data));
             DemandWrite(path, viewer);
-            var record = await Store.UpdateAsync(path, patch, viewer.Id, cancellationToken)
+            var record = await store.UpdateAsync(path, patch, viewer.Id, cancellationToken)
                 ?? throw ArtifactDbException.Invalid("update needs an existing document; use set to create one");
             Changed(path);
             return Snapshot(path, record);
@@ -96,11 +99,11 @@ public sealed class ArtifactDbTools
         IHttpContextAccessor http, ILogger<ArtifactDbTools> logger,
         [Description(PathDescription)] string path,
         CancellationToken cancellationToken) =>
-        Run(http, logger, async viewer =>
+        Run(http, logger, async (viewer, store) =>
         {
             ArtifactPaths.Document(path);
             DemandWrite(path, viewer);
-            await Store.RemoveAsync(path, cancellationToken);
+            await store.RemoveAsync(path, cancellationToken);
             Changed(path);
             return new JsonObject { ["deleted"] = path };
         });
@@ -109,7 +112,7 @@ public sealed class ArtifactDbTools
     private static void Changed(string path) => ArtifactEvents.Shared.Publish(ArtifactPaths.Parent(path));
 
     private static bool Can(string path, string action, ArtifactViewer viewer) =>
-        ArtifactRules.CanAccess(Rules.Value, path, action, viewer);
+        CosmosTokenPassthrough.Enabled || ArtifactRules.CanAccess(Rules.Value, path, action, viewer);
 
     private static void DemandWrite(string path, ArtifactViewer viewer)
     {
@@ -132,11 +135,12 @@ public sealed class ArtifactDbTools
     private static JsonNode? ToNode(JsonElement? element) =>
         element is { ValueKind: not (JsonValueKind.Undefined or JsonValueKind.Null) } e ? JsonNode.Parse(e.GetRawText()) : null;
 
-    private static async Task<CallToolResult> Run(IHttpContextAccessor http, ILogger logger, Func<ArtifactViewer, Task<JsonObject>> work)
+    private static async Task<CallToolResult> Run(IHttpContextAccessor http, ILogger logger, Func<ArtifactViewer, ArtifactStore, Task<JsonObject>> work)
     {
         try
         {
-            var result = await work(ArtifactViewer.From(http.HttpContext?.User));
+            var viewer = ArtifactViewer.From(http.HttpContext?.User);
+            var result = await work(viewer, ArtifactStore.For(http.HttpContext, viewer));
             return new CallToolResult
             {
                 Content = [new TextContentBlock { Text = result.ToJsonString() }],
@@ -146,6 +150,13 @@ public sealed class ArtifactDbTools
         catch (ArtifactDbException e)
         {
             return Fail(e.Code, e.Message);
+        }
+        catch (CosmosException e)
+        {
+            // The stream APIs return failures, but setting up a client (reading the account) can throw them.
+            var error = ArtifactStore.ErrorFor(e.StatusCode, e.SubStatusCode.ToString(), e.ResponseBody ?? e.Message);
+            if (error.Code == "unavailable") logger.LogError(e, "Artifact database call failed");
+            return Fail(error.Code, error.Message);
         }
         catch (Exception e)
         {

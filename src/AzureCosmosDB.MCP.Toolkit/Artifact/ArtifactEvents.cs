@@ -3,8 +3,11 @@
 // and the page re-reads through db_query, so the artifact's rules still decide what it sees.
 //
 // Changes come from two places:
-//   - Cosmos DB's change feed (latest-version mode, from "now"), read every second while anyone is subscribed and
-//     stopped a minute after the last one leaves. It reports creates and updates made through any replica.
+//   - Cosmos DB's change feed (latest-version mode, from "now") of every container the artifact uses (the default
+//     one and ARTIFACT_CONTAINERS, ArtifactStore.cs), read every second while anyone is subscribed and stopped a
+//     minute after the last one leaves. It reports creates and updates made through any replica. It is always read
+//     with the server's managed identity, even with token passthrough on (it is a Data Reader then): it only ever
+//     publishes collection names, never data.
 //   - This replica's own writes (db_set, db_update, db_delete), published at once. The change feed doesn't report
 //     deletes, so a delete made through another replica reaches pages through their fallback polling.
 using System.Collections.Concurrent;
@@ -17,19 +20,21 @@ namespace AzureCosmosDB.MCP.Toolkit.Artifact;
 
 public sealed class ArtifactEvents
 {
-    public static ArtifactEvents Shared { get; } = new(() => ArtifactStore.Shared.Docs);
+    public static ArtifactEvents Shared { get; } = new(() => ArtifactStore.Shared.AllContainers());
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan IdleStop = TimeSpan.FromMinutes(1);
 
-    private readonly Func<Container> _container;
+    private static readonly TimeSpan FailureBackoff = TimeSpan.FromSeconds(5);
+
+    private readonly Func<IReadOnlyList<Container>> _containers;
     private readonly ConcurrentDictionary<Guid, Channel<string>> _subscribers = new();
     private readonly object _gate = new();
     private Task? _feed;
 
-    public ArtifactEvents(Func<Container> container)
+    public ArtifactEvents(Func<IReadOnlyList<Container>> containers)
     {
-        _container = container;
+        _containers = containers;
     }
 
     public ILogger? Logger { get; set; }
@@ -60,11 +65,18 @@ public sealed class ArtifactEvents
         }
     }
 
+    // Where one container's change feed is up to.
+    private sealed class Feed
+    {
+        public FeedIterator? Iterator;
+        public string? Continuation;
+        public DateTimeOffset RetryAt;
+    }
+
     private async Task ReadChangeFeedAsync()
     {
         var idleSince = DateTimeOffset.UtcNow;
-        FeedIterator? iterator = null;
-        string? continuation = null;
+        var feeds = new Dictionary<string, Feed>();
         while (true)
         {
             if (_subscribers.IsEmpty)
@@ -76,33 +88,50 @@ public sealed class ArtifactEvents
                 idleSince = DateTimeOffset.UtcNow;
             }
 
+            IReadOnlyList<Container> containers;
             try
             {
-                iterator ??= _container().GetChangeFeedStreamIterator(
-                    continuation is null ? ChangeFeedStartFrom.Now() : ChangeFeedStartFrom.ContinuationToken(continuation),
-                    ChangeFeedMode.LatestVersion,
-                    new ChangeFeedRequestOptions { PageSizeHint = 100 });
-                using var page = await iterator.ReadNextAsync();
-                continuation = page.ContinuationToken ?? continuation;
-                if (page.StatusCode == HttpStatusCode.NotModified)
-                {
-                    await Task.Delay(PollInterval);
-                    continue;
-                }
-                page.EnsureSuccessStatusCode();
-                var body = await JsonNode.ParseAsync(page.Content);
-                var collections = (body?["Documents"]?.AsArray() ?? [])
-                    .Select(d => d?["collection"]?.GetValue<string>())
-                    .Where(c => !string.IsNullOrEmpty(c))
-                    .Distinct();
-                foreach (var c in collections) Publish(c!);
+                containers = _containers();
             }
             catch (Exception e)
             {
                 Logger?.LogWarning(e, "Reading the artifact change feed failed; retrying");
-                iterator = null;
-                await Task.Delay(TimeSpan.FromSeconds(5));
+                await Task.Delay(FailureBackoff);
+                continue;
             }
+
+            var changed = false;
+            foreach (var container in containers)
+            {
+                if (!feeds.TryGetValue(container.Id, out var feed)) feeds[container.Id] = feed = new Feed();
+                if (DateTimeOffset.UtcNow < feed.RetryAt) continue;
+                try
+                {
+                    feed.Iterator ??= container.GetChangeFeedStreamIterator(
+                        feed.Continuation is null ? ChangeFeedStartFrom.Now() : ChangeFeedStartFrom.ContinuationToken(feed.Continuation),
+                        ChangeFeedMode.LatestVersion,
+                        new ChangeFeedRequestOptions { PageSizeHint = 100 });
+                    using var page = await feed.Iterator.ReadNextAsync();
+                    feed.Continuation = page.ContinuationToken ?? feed.Continuation;
+                    if (page.StatusCode == HttpStatusCode.NotModified) continue;
+                    page.EnsureSuccessStatusCode();
+                    changed = true;
+                    var body = await JsonNode.ParseAsync(page.Content);
+                    var collections = (body?["Documents"]?.AsArray() ?? [])
+                        .Select(d => d?["collection"]?.GetValue<string>())
+                        .Where(c => !string.IsNullOrEmpty(c))
+                        .Distinct();
+                    foreach (var c in collections) Publish(c!);
+                }
+                catch (Exception e)
+                {
+                    // One container failing (not created yet, say) doesn't hold up the others.
+                    Logger?.LogWarning(e, "Reading the change feed of container {Container} failed; retrying", container.Id);
+                    feed.Iterator = null;
+                    feed.RetryAt = DateTimeOffset.UtcNow + FailureBackoff;
+                }
+            }
+            if (!changed) await Task.Delay(PollInterval);
         }
         lock (_gate) _feed = null;
         if (!_subscribers.IsEmpty) EnsureFeed(); // someone subscribed while it was stopping
@@ -123,11 +152,12 @@ public static class ArtifactEventsEndpoint
     // Under Azure Functions' 230-second limit on an HTTP response, so the stream ends cleanly before the platform cuts it.
     private static readonly TimeSpan MaxStream = TimeSpan.FromSeconds(200);
 
-    /// <summary>GET /events: server-sent events, one "change" per changed collection, for callers with a level.</summary>
+    /// <summary>GET /events: server-sent events, one "change" per changed collection, for callers with a level (with
+    /// token passthrough on, for anyone signed in: Cosmos DB, not their level, decides what they can read).</summary>
     public static async Task Handle(HttpContext context)
     {
         var viewer = ArtifactViewer.From(context.User);
-        if (viewer.Level is null)
+        if (CosmosTokenPassthrough.Enabled ? viewer.Id is null : viewer.Level is null)
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return;

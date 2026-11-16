@@ -1,0 +1,122 @@
+// Token passthrough (test only): the db tools call Cosmos DB as the person using the page, with a Cosmos DB access
+// token they got from the Azure CLI and pasted into the page, so Cosmos DB's own role assignments (per container,
+// from policy.json's "cosmos" section) decide what they may read, write and delete. A stand-in for on-behalf-of until
+// there's an app registration; see docs/cosmos-token-passthrough.md.
+//
+// It breaks the MCP spec's rule that a server only accepts tokens issued for itself, so it is off unless
+// COSMOS_TOKEN_PASSTHROUGH is true, and isn't meant to ship. When it is on:
+//   - The page sends the token in the X-Cosmos-Token header next to its ticket, which still says who is signed in.
+//   - The token's signature isn't checked here: Cosmos DB checks it on every call. This only refuses tokens that
+//     can't be the caller's own: tid must be this tenant (AzureAd__TenantId), exp in the future, aud Cosmos DB
+//     (https://cosmos.azure.com or this account's endpoint, COSMOS_ENDPOINT), and its upn, preferred_username,
+//     unique_name or email the caller's sign-in email, so updatedBy stays honest.
+//   - One CosmosClient per token (keyed by its SHA-256), dropped once the token expires: a client is expensive to make.
+//   - There is no fallback to the server's managed identity, which only reads the change feed for /events.
+// The token is never logged.
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Azure.Core;
+using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Azure.Cosmos;
+
+namespace AzureCosmosDB.MCP.Toolkit.Artifact;
+
+public static class CosmosTokenPassthrough
+{
+    public const string Header = "X-Cosmos-Token";
+    private const int MaxTokenLength = 16 * 1024;
+    private static readonly TimeSpan ClockSkew = TimeSpan.FromSeconds(30);
+    private static readonly string[] EmailClaims = ["upn", "preferred_username", "unique_name", "email"];
+
+    public static bool Enabled =>
+        bool.TryParse(Environment.GetEnvironmentVariable("COSMOS_TOKEN_PASSTHROUGH"), out var on) && on;
+
+    public sealed record TokenClaims(string Email, DateTimeOffset Expires);
+
+    /// <summary>The token's caller and expiry, or unauthenticated unless it could be <paramref name="email"/>'s own Cosmos DB token.</summary>
+    public static TokenClaims Check(string? token, string? email, DateTimeOffset now)
+    {
+        if (string.IsNullOrWhiteSpace(token)) throw Unauthenticated("paste a Cosmos DB token");
+        if (string.IsNullOrWhiteSpace(email)) throw Unauthenticated("sign in first");
+        if (token.Length > MaxTokenLength) throw Unauthenticated("that isn't a Cosmos DB token");
+
+        JsonElement claims;
+        try
+        {
+            var parts = token.Split('.');
+            if (parts.Length != 3) throw Unauthenticated("that isn't a Cosmos DB token");
+            using var doc = JsonDocument.Parse(WebEncoders.Base64UrlDecode(parts[1]));
+            claims = doc.RootElement.Clone();
+        }
+        catch (Exception e) when (e is FormatException or JsonException or ArgumentException)
+        {
+            throw Unauthenticated("that isn't a Cosmos DB token");
+        }
+        if (claims.ValueKind != JsonValueKind.Object) throw Unauthenticated("that isn't a Cosmos DB token");
+
+        string? Text(string name) =>
+            claims.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+        var tenant = Environment.GetEnvironmentVariable("AzureAd__TenantId");
+        if (string.IsNullOrWhiteSpace(tenant) || !string.Equals(Text("tid"), tenant.Trim(), StringComparison.OrdinalIgnoreCase))
+            throw Unauthenticated("the Cosmos DB token is from another tenant; az login --tenant " + tenant);
+
+        if (!claims.TryGetProperty("exp", out var expClaim) || !expClaim.TryGetInt64(out var exp))
+            throw Unauthenticated("the Cosmos DB token has no expiry");
+        var expires = DateTimeOffset.FromUnixTimeSeconds(exp);
+        if (expires <= now + ClockSkew) throw Unauthenticated("the Cosmos DB token has expired; paste a new one");
+
+        if (!Audiences().Contains(Normalize(Text("aud")))) throw Unauthenticated("the token isn't for Cosmos DB");
+
+        var me = email.Trim().ToLowerInvariant();
+        if (!EmailClaims.Any(c => string.Equals(Text(c)?.Trim(), me, StringComparison.OrdinalIgnoreCase)))
+            throw Unauthenticated("the Cosmos DB token is someone else's; paste your own");
+
+        return new TokenClaims(me, expires);
+    }
+
+    // https://cosmos.azure.com, and the account's own endpoint (COSMOS_ENDPOINT is https://<account>.documents.azure.com:443/).
+    private static HashSet<string> Audiences()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "https://cosmos.azure.com" };
+        if (Uri.TryCreate(Environment.GetEnvironmentVariable("COSMOS_ENDPOINT"), UriKind.Absolute, out var endpoint))
+            set.Add($"https://{endpoint.Host}");
+        return set;
+    }
+
+    private static string Normalize(string? aud) =>
+        (aud ?? "").Trim().TrimEnd('/').Replace(":443", "", StringComparison.Ordinal);
+
+    private static ArtifactDbException Unauthenticated(string message) => new("unauthenticated", message);
+
+    private sealed record Cached(ArtifactStore Store, CosmosClient Client, DateTimeOffset Expires);
+    private static readonly ConcurrentDictionary<string, Cached> Stores = new();
+
+    /// <summary>A store that reaches Cosmos DB with this token, shared by every call that brings the same token.</summary>
+    public static ArtifactStore StoreFor(string token, DateTimeOffset expires, DateTimeOffset now)
+    {
+        foreach (var (key, stale) in Stores)
+        {
+            if (stale.Expires <= now && Stores.TryRemove(key, out _)) stale.Client.Dispose();
+        }
+        var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+        return Stores.GetOrAdd(id, _ =>
+        {
+            var client = ArtifactStore.NewClient(new StaticTokenCredential(token, expires));
+            return new Cached(new ArtifactStore(client), client, expires);
+        }).Store;
+    }
+
+    /// <summary>The token the caller pasted. Cosmos DB asks for whatever scope it likes; the answer is always this token.</summary>
+    private sealed class StaticTokenCredential(string token, DateTimeOffset expires) : TokenCredential
+    {
+        private readonly AccessToken _token = new(token, expires);
+
+        public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken) => _token;
+
+        public override ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(_token);
+    }
+}
