@@ -388,43 +388,98 @@ public class OAuthDiscoveryTests : IClassFixture<AuthEnabledApplicationFactory>
     }
 }
 
-/// <summary>People coming through the artifact's Static Web App, identified by its x-ms-client-principal header.</summary>
+/// <summary>The artifact's page: tickets from the Static Web App's "ticket" function, signed with TICKET_SECRET.</summary>
 [Collection("Environment variables")]
-public class StaticWebAppsAuthenticationTests : IClassFixture<AuthEnabledApplicationFactory>
+public class TicketAuthenticationTests : IClassFixture<AuthEnabledApplicationFactory>
 {
+    private const string Secret = "test-secret";
+    private const string Audience = "mcp.example.net";
     private readonly HttpClient _client;
 
-    public StaticWebAppsAuthenticationTests(AuthEnabledApplicationFactory factory)
+    public TicketAuthenticationTests(AuthEnabledApplicationFactory factory)
     {
         _client = factory.CreateClient();
     }
 
-    private static string Principal(string provider, string details) =>
-        Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
-        {
-            identityProvider = provider, userId = "swa-123", userDetails = details, userRoles = new[] { "anonymous", "authenticated" },
-        })));
+    // What the function in src/runtime/api/ticket makes.
+    private static string Ticket(string email, string secret = Secret, string aud = Audience, int lifetime = 60, int age = 0)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - age;
+        var payload = Microsoft.AspNetCore.WebUtilities.WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(
+            JsonSerializer.Serialize(new { sub = email, aud, iat = now, exp = now + lifetime })));
+        var signature = System.Security.Cryptography.HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), Encoding.ASCII.GetBytes(payload));
+        return payload + "." + Microsoft.AspNetCore.WebUtilities.WebEncoders.Base64UrlEncode(signature);
+    }
 
-    private static ArtifactViewer Viewer(string provider, string details) =>
-        ArtifactViewer.From(StaticWebAppsAuthenticationHandler.Parse(Principal(provider, details)));
+    private static ArtifactViewer Viewer(string email) =>
+        ArtifactViewer.From(TicketAuthenticationHandler.Validate(Ticket(email), DateTimeOffset.UtcNow));
 
     private static void WithSettings(Dictionary<string, string?> settings, Action test)
     {
-        foreach (var (k, v) in settings) Environment.SetEnvironmentVariable(k, v);
+        var all = new Dictionary<string, string?>(settings) { ["TICKET_SECRET"] = Secret, ["TICKET_AUDIENCE"] = Audience };
+        foreach (var (k, v) in all) Environment.SetEnvironmentVariable(k, v);
         try { test(); }
-        finally { foreach (var k in settings.Keys) Environment.SetEnvironmentVariable(k, null); }
+        finally { foreach (var k in all.Keys) Environment.SetEnvironmentVariable(k, null); }
+    }
+
+    private static async Task WithSettingsAsync(Func<Task> test)
+    {
+        Environment.SetEnvironmentVariable("TICKET_SECRET", Secret);
+        Environment.SetEnvironmentVariable("TICKET_AUDIENCE", Audience);
+        Environment.SetEnvironmentVariable("ARTIFACT_OWNER_EMAIL", "owner@example.com");
+        try { await test(); }
+        finally
+        {
+            foreach (var k in new[] { "TICKET_SECRET", "TICKET_AUDIENCE", "ARTIFACT_OWNER_EMAIL" }) Environment.SetEnvironmentVariable(k, null);
+        }
     }
 
     [Fact]
-    public void Only_entra_sign_ins_with_an_email_are_accepted()
+    public void Only_genuine_current_tickets_for_this_server_are_accepted() => WithSettings(new(), () =>
     {
-        StaticWebAppsAuthenticationHandler.Parse(Principal("aad", "Jane.Doe@Example.com"))!
+        var now = DateTimeOffset.UtcNow;
+        TicketAuthenticationHandler.Validate(Ticket("Jane.Doe@Example.com"), now)!
             .FindFirst("email")!.Value.Should().Be("jane.doe@example.com");
-        StaticWebAppsAuthenticationHandler.Parse(Principal("github", "jane@example.com")).Should().BeNull();
-        StaticWebAppsAuthenticationHandler.Parse(Principal("aad", "janedoe")).Should().BeNull();
-        StaticWebAppsAuthenticationHandler.Parse("not base64!").Should().BeNull();
-        StaticWebAppsAuthenticationHandler.Parse(Convert.ToBase64String(Encoding.UTF8.GetBytes("[]"))).Should().BeNull();
+        TicketAuthenticationHandler.Validate(Ticket("jane@example.com", secret: "wrong"), now).Should().BeNull();
+        TicketAuthenticationHandler.Validate(Ticket("jane@example.com", aud: "other.example.net"), now).Should().BeNull();
+        TicketAuthenticationHandler.Validate(Ticket("jane@example.com", age: 120), now).Should().BeNull();       // expired
+        TicketAuthenticationHandler.Validate(Ticket("jane@example.com", lifetime: 3600), now).Should().BeNull(); // too long
+        TicketAuthenticationHandler.Validate(Ticket("janedoe"), now).Should().BeNull();
+        TicketAuthenticationHandler.Validate("not.a ticket", now).Should().BeNull();
+
+        // A changed email breaks the signature.
+        var parts = Ticket("jane@example.com").Split('.');
+        var forged = Microsoft.AspNetCore.WebUtilities.WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(
+            Encoding.UTF8.GetString(Microsoft.AspNetCore.WebUtilities.WebEncoders.Base64UrlDecode(parts[0])).Replace("jane@", "owner@")));
+        TicketAuthenticationHandler.Validate(forged + "." + parts[1], now).Should().BeNull();
+    });
+
+    [Fact]
+    public void Tickets_from_the_function_are_accepted() => WithSettings(new(), () =>
+    {
+        // Made by src/runtime/api/ticket/index.js with TICKET_SECRET=test-secret, TICKET_AUDIENCE=mcp.example.net
+        const string fromFunction ="eyJzdWIiOiJqYW5lLmRvZUBleGFtcGxlLmNvbSIsImF1ZCI6Im1jcC5leGFtcGxlLm5ldCIsImlhdCI6MTc5NDgyNDM2MiwiZXhwIjoxNzk0ODI0NDIyfQ"
+            + ".EHbs5jhqtbeXuR7Y5AnKSgVMcgQKWiZqkGT--K_3iB4";
+        var issued = DateTimeOffset.FromUnixTimeSeconds(1794824362);
+        TicketAuthenticationHandler.Validate(fromFunction, issued.AddSeconds(30))!
+            .FindFirst("email")!.Value.Should().Be("jane.doe@example.com");
+        TicketAuthenticationHandler.Validate(fromFunction, issued.AddMinutes(5)).Should().BeNull();
+    });
+
+    [Fact]
+    public void Without_a_secret_no_ticket_is_accepted()
+    {
+        TicketAuthenticationHandler.Validate(Ticket("jane@example.com"), DateTimeOffset.UtcNow).Should().BeNull();
     }
+
+    [Fact]
+    public void The_previous_secret_still_works_while_changing_secrets() => WithSettings(new()
+    {
+        ["TICKET_SECRET_PREVIOUS"] = "old-secret",
+    }, () =>
+    {
+        TicketAuthenticationHandler.Validate(Ticket("jane@example.com", secret: "old-secret"), DateTimeOffset.UtcNow).Should().NotBeNull();
+    });
 
     [Fact]
     public void Levels_come_from_the_owner_email_and_the_access_list() => WithSettings(new()
@@ -433,14 +488,14 @@ public class StaticWebAppsAuthenticationTests : IClassFixture<AuthEnabledApplica
         ["ARTIFACT_ACCESS"] = """{"editors":["ed@example.com"],"contributors":["Con@Example.com"],"viewers":["vi@other.org"]}""",
     }, () =>
     {
-        var owner = Viewer("aad", "owner@example.com");
+        var owner = Viewer("owner@example.com");
         owner.Level.Should().Be("owner");
         owner.Id.Should().Be("owner@example.com");
         owner.Name.Should().Be("Owner");
-        Viewer("aad", "ed@example.com").Level.Should().Be("admin");
-        Viewer("aad", "con@example.com").Level.Should().Be("interact");
-        Viewer("aad", "vi@other.org").Level.Should().Be("view");
-        Viewer("aad", "someone@example.com").Level.Should().BeNull();
+        Viewer("ed@example.com").Level.Should().Be("admin");
+        Viewer("con@example.com").Level.Should().Be("interact");
+        Viewer("vi@other.org").Level.Should().Be("view");
+        Viewer("someone@example.com").Level.Should().BeNull();
     });
 
     [Fact]
@@ -450,11 +505,11 @@ public class StaticWebAppsAuthenticationTests : IClassFixture<AuthEnabledApplica
         ["ARTIFACT_EMAIL_DOMAINS"] = "example.com, example.co.uk",
     }, () =>
     {
-        Viewer("aad", "jane.doe@example.com").Level.Should().Be("interact");
-        Viewer("aad", "jane.doe@example.com").Name.Should().Be("Jane Doe");
-        Viewer("aad", "j@example.co.uk").Level.Should().Be("interact");
-        Viewer("aad", "j@gmail.com").Level.Should().BeNull();
-        Viewer("aad", "j@notexample.com").Level.Should().BeNull();
+        Viewer("jane.doe@example.com").Level.Should().Be("interact");
+        Viewer("jane.doe@example.com").Name.Should().Be("Jane Doe");
+        Viewer("j@example.co.uk").Level.Should().Be("interact");
+        Viewer("j@gmail.com").Level.Should().BeNull();
+        Viewer("j@notexample.com").Level.Should().BeNull();
     });
 
     [Fact]
@@ -471,17 +526,17 @@ public class StaticWebAppsAuthenticationTests : IClassFixture<AuthEnabledApplica
         viewer.Name.Should().Be("Jane");
     });
 
-    private async Task<HttpResponseMessage> Get(string path, string? principal)
+    private Task<HttpResponseMessage> Get(string path, string? ticket)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, path);
-        if (principal is not null) request.Headers.Add("x-ms-client-principal", principal);
-        return await _client.SendAsync(request);
+        if (ticket is not null) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ticket);
+        return _client.SendAsync(request);
     }
 
     [Fact]
-    public async Task Api_me_answers_for_the_person_in_the_header() => await WithSettingsAsync(async () =>
+    public async Task Me_answers_for_the_person_in_the_ticket() => await WithSettingsAsync(async () =>
     {
-        var response = await Get("/api/me", Principal("aad", "owner@example.com"));
+        var response = await Get("/me", Ticket("owner@example.com"));
         response.IsSuccessStatusCode.Should().BeTrue();
         var me = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
         me["id"]!.GetValue<string>().Should().Be("owner@example.com");
@@ -489,17 +544,25 @@ public class StaticWebAppsAuthenticationTests : IClassFixture<AuthEnabledApplica
     });
 
     [Fact]
-    public async Task The_header_is_trusted_on_api_paths_only() => await WithSettingsAsync(async () =>
+    public async Task Bad_tickets_and_the_old_header_are_refused() => await WithSettingsAsync(async () =>
     {
-        ((int)(await Get("/api/me", null)).StatusCode).Should().Be(401);
-        ((int)(await Get("/me", Principal("aad", "owner@example.com"))).StatusCode).Should().Be(401);
-        ((int)(await Get("/events", Principal("aad", "owner@example.com"))).StatusCode).Should().Be(401);
+        ((int)(await Get("/me", Ticket("owner@example.com", secret: "wrong"))).StatusCode).Should().Be(401);
+        ((int)(await Get("/me", null)).StatusCode).Should().Be(401);
+
+        var header = Convert.ToBase64String(Encoding.UTF8.GetBytes(
+            """{"identityProvider":"aad","userId":"x","userDetails":"owner@example.com","userRoles":["authenticated"]}"""));
+        foreach (var path in new[] { "/me", "/api/me" })
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get, path);
+            request.Headers.Add("x-ms-client-principal", header);
+            ((int)(await _client.SendAsync(request)).StatusCode).Should().BeOneOf(401, 404);
+        }
     });
 
-    private static async Task WithSettingsAsync(Func<Task> test)
+    [Fact]
+    public async Task Calls_without_a_ticket_still_tell_claude_the_scope() => await WithSettingsAsync(async () =>
     {
-        Environment.SetEnvironmentVariable("ARTIFACT_OWNER_EMAIL", "owner@example.com");
-        try { await test(); }
-        finally { Environment.SetEnvironmentVariable("ARTIFACT_OWNER_EMAIL", null); }
-    }
+        var response = await Get("/me", null);
+        response.Headers.WwwAuthenticate.ToString().Should().Contain("scope=");
+    });
 }

@@ -61,8 +61,9 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
     
     // Add JWT Bearer authentication only if configuration is available. MCP clients such as Claude find how to sign
     // in from /.well-known/oauth-authorization-server (mapped below) and the scope in each 401.
+    // The default scheme ("Artifact", below) forwards Entra tokens here.
     builder.Services
-        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddAuthentication()
         .AddJwtBearer(options =>
         {
             options.Authority = $"https://login.microsoftonline.com/{tenantId}/v2.0";
@@ -197,16 +198,24 @@ else
     });
 }
 
-// People using the artifact's page come through its Static Web App, on /api/* only, identified by the
-// x-ms-client-principal header it adds (Artifact/StaticWebAppsAuthentication.cs). This works without the MCP server
-// API registration above, which only Claude needs.
-builder.Services.AddAuthentication()
-    .AddScheme<AuthenticationSchemeOptions, AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler>(
-        AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.SchemeName, null);
-builder.Services.AddAuthorization(options =>
-    options.AddPolicy(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PolicyName, p => p
-        .AddAuthenticationSchemes(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.SchemeName)
-        .RequireAuthenticatedUser()));
+// People using the artifact's page sign in with its Static Web App, whose "ticket" managed function gives the page a
+// short-lived ticket signed with TICKET_SECRET (Artifact/TicketAuthentication.cs). The page sends it as a bearer
+// token, like Claude's Entra tokens; tickets have two dot-separated parts and JWTs three, which picks the scheme.
+// Tickets work without the MCP server API registration above, which only Claude needs.
+var jwtConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId);
+builder.Services
+    .AddAuthentication(options =>
+    {
+        options.DefaultScheme = "Artifact";
+        options.DefaultChallengeScheme = "Artifact";
+    })
+    .AddScheme<AuthenticationSchemeOptions, AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler>(
+        AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.SchemeName, null)
+    .AddPolicyScheme("Artifact", "Ticket or Entra token", options =>
+        options.ForwardDefaultSelector = context =>
+            AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.HasTicket(context.Request) || !jwtConfigured
+                ? AzureCosmosDB.MCP.Toolkit.Artifact.TicketAuthenticationHandler.SchemeName
+                : JwtBearerDefaults.AuthenticationScheme);
 
 // Add HTTP context accessor for authentication
 builder.Services.AddHttpContextAccessor();
@@ -377,14 +386,6 @@ else
     app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle);
     app.MapGet("/me", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactViewer.Me);
 }
-
-// The artifact's page, through its Static Web App (which proxies /api/* here, path kept). No /api/events: the Static
-// Web App ends every proxied request after 45 seconds, so the page polls instead.
-app.MapMcp(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PathPrefix + "/mcp")
-    .RequireAuthorization(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PolicyName);
-app.MapGet(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PathPrefix + "/me",
-        AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactViewer.Me)
-    .RequireAuthorization(AzureCosmosDB.MCP.Toolkit.Artifact.StaticWebAppsAuthenticationHandler.PolicyName);
 
 // No web UI: the toolkit's tester (wwwroot, /api/mcp and /mcp/http) served its own tools without the artifact's
 // rules, /api/mcp without authentication, so it is removed. /mcp, /events and /health remain.

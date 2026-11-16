@@ -1,6 +1,6 @@
 // Who is calling and their level. A caller is identified by their sign-in email, lower-cased (their Entra object ID
 // only when the token carries no email), so the same person has the same ID whether they come through the artifact's
-// Static Web App (StaticWebAppsAuthentication.cs) or with an Entra token (Claude).
+// Static Web App (a ticket, TicketAuthentication.cs) or with an Entra token (Claude).
 //
 // Their level, first match wins:
 //   owner     the principal that deployed the instance: ARTIFACT_OWNER_ID (object ID) or ARTIFACT_OWNER_EMAIL
@@ -24,7 +24,7 @@ public sealed record ArtifactViewer(string? Id, string? Level, string? Email = n
     public static ArtifactViewer From(ClaimsPrincipal? user)
     {
         if (user?.Identity?.IsAuthenticated != true) return new ArtifactViewer(null, null);
-        var throughStaticWebApp = user.Identity.AuthenticationType == StaticWebAppsAuthenticationHandler.SchemeName;
+        var throughStaticWebApp = user.Identity.AuthenticationType == TicketAuthenticationHandler.SchemeName;
         var oid = user.FindFirst("oid")?.Value ?? user.FindFirst(ObjectIdClaim)?.Value;
         var email = EmailClaims.Select(c => user.FindFirst(c)?.Value).FirstOrDefault(v => v is not null && v.Contains('@'))
             ?.Trim().ToLowerInvariant();
@@ -40,7 +40,7 @@ public sealed record ArtifactViewer(string? Id, string? Level, string? Email = n
         return new ArtifactViewer(email ?? oid, level, email, string.IsNullOrWhiteSpace(name) ? NameFrom(email) : name);
     }
 
-    /// <summary>GET /me (Entra tokens) and /api/me (through the Static Web App): who the caller is to this artifact.</summary>
+    /// <summary>GET /me: who the caller (a ticket or an Entra token) is to this artifact.</summary>
     public static IResult Me(HttpContext context)
     {
         var v = From(context.User);

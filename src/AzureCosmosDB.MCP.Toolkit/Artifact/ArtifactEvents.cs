@@ -119,6 +119,8 @@ public sealed class ArtifactEvents
 public static class ArtifactEventsEndpoint
 {
     private static readonly TimeSpan Heartbeat = TimeSpan.FromSeconds(25); // under the ingress idle timeout
+    // Streams end after this, and the page reconnects: a ticket lasts a minute, so the caller's access is checked again.
+    private static readonly TimeSpan MaxStream = TimeSpan.FromMinutes(10);
 
     /// <summary>GET /events: server-sent events, one "change" per changed collection, for callers with a level.</summary>
     public static async Task Handle(HttpContext context)
@@ -140,9 +142,10 @@ public static class ArtifactEventsEndpoint
         var events = ArtifactEvents.Shared;
         events.Logger ??= context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger<ArtifactEvents>();
         using var subscription = events.Subscribe();
+        var deadline = DateTimeOffset.UtcNow + MaxStream;
         try
         {
-            while (!ct.IsCancellationRequested)
+            while (!ct.IsCancellationRequested && DateTimeOffset.UtcNow < deadline)
             {
                 using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 wait.CancelAfter(Heartbeat);
