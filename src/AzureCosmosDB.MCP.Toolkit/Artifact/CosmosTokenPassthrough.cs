@@ -20,6 +20,9 @@
 // Program.cs routes such a bearer (IsCosmosBearer) to the "CosmosToken" JwtBearer scheme, which checks its signature,
 // issuer (this tenant) and audience (Audiences) against Entra. ArtifactStore.For then uses that bearer as the Cosmos
 // DB token when there's no X-Cosmos-Token header. See docs/cosmos-token-passthrough.md, "Claude Code".
+//
+// With the app registration, Entra callers need none of this: on-behalf-of (CosmosOnBehalfOf.cs) gets their Cosmos DB
+// token for them. Passthrough remains for the page's tickets, which can't be exchanged.
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
@@ -142,16 +145,23 @@ public static class CosmosTokenPassthrough
     private static readonly ConcurrentDictionary<string, Cached> Stores = new();
 
     /// <summary>A store that reaches Cosmos DB with this token, shared by every call that brings the same token.</summary>
-    public static ArtifactStore StoreFor(string token, DateTimeOffset expires, DateTimeOffset now)
+    public static ArtifactStore StoreFor(string token, DateTimeOffset expires, DateTimeOffset now) =>
+        StoreFor(token, () => new StaticTokenCredential(token, expires), expires, now);
+
+    /// <summary>
+    /// A store per key (a token, hashed) with the credential made for it, until <paramref name="expires"/>: shared
+    /// with on-behalf-of (CosmosOnBehalfOf.cs), which keys by the caller's bearer token.
+    /// </summary>
+    public static ArtifactStore StoreFor(string key, Func<TokenCredential> credential, DateTimeOffset expires, DateTimeOffset now)
     {
-        foreach (var (key, stale) in Stores)
+        foreach (var (k, stale) in Stores)
         {
-            if (stale.Expires <= now && Stores.TryRemove(key, out _)) stale.Client.Dispose();
+            if (stale.Expires <= now && Stores.TryRemove(k, out _)) stale.Client.Dispose();
         }
-        var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+        var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)));
         return Stores.GetOrAdd(id, _ =>
         {
-            var client = ArtifactStore.NewClient(new StaticTokenCredential(token, expires));
+            var client = ArtifactStore.NewClient(credential());
             return new Cached(new ArtifactStore(client), client, expires);
         }).Store;
     }

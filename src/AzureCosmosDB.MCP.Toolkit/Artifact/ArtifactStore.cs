@@ -8,8 +8,9 @@
 // allowed in path segments). Items: {id, path, collection, docId, data, version, updatedAt, updatedBy}.
 //
 // Which identity reaches Cosmos DB: the server's managed identity (Shared), or with COSMOS_TOKEN_PASSTHROUGH on, the
-// caller's own Cosmos DB token (For, CosmosTokenPassthrough.cs): the X-Cosmos-Token header, or for Claude Code the
-// bearer token itself once the CosmosToken scheme has verified it. So Cosmos DB refuses what they may not do. Its
+// caller (For): for an Entra caller, a Cosmos DB token got on their behalf (CosmosOnBehalfOf.cs); otherwise their own
+// pasted one (CosmosTokenPassthrough.cs), the X-Cosmos-Token header or a bearer the CosmosToken scheme has verified.
+// So Cosmos DB refuses what they may not do. Its
 // refusals are permission_denied (403) and unauthenticated (401).
 using System.Net;
 using System.Text;
@@ -32,9 +33,11 @@ public sealed class ArtifactStore
     public static ArtifactStore For(HttpContext? context, ArtifactViewer viewer)
     {
         if (!CosmosTokenPassthrough.Enabled) return Shared;
+        var now = DateTimeOffset.UtcNow;
+        if (CosmosOnBehalfOf.Enabled && CosmosOnBehalfOf.EntraBearer(context) is { } bearer)
+            return CosmosOnBehalfOf.StoreFor(bearer, now);
         var token = context?.Request.Headers[CosmosTokenPassthrough.Header].ToString().Trim();
         if (string.IsNullOrEmpty(token)) token = CosmosTokenPassthrough.VerifiedBearer(context);
-        var now = DateTimeOffset.UtcNow;
         var claims = CosmosTokenPassthrough.Check(token, viewer.Email, now);
         return CosmosTokenPassthrough.StoreFor(token!, claims.Expires, now);
     }

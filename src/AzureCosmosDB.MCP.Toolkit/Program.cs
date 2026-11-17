@@ -94,6 +94,9 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
                 ValidateIssuerSigningKey = true,
                 ClockSkew = TimeSpan.FromMinutes(2),
                 RoleClaimType = "roles",
+                // Named after this scheme so CosmosOnBehalfOf.EntraBearer recognises an Entra caller and exchanges their
+                // token for a Cosmos DB one (the default is "AuthenticationTypes.Federation").
+                AuthenticationType = JwtBearerDefaults.AuthenticationScheme,
             };
 
             options.MapInboundClaims = false;
@@ -208,6 +211,8 @@ else
 // Azure CLI as its bearer token, with no app registration (docs/cosmos-token-passthrough.md, "Claude Code"). That
 // token then says who is calling, so the "CosmosToken" scheme verifies it against Entra: signature, this tenant as
 // issuer, a Cosmos DB audience, lifetime. A bearer goes there when its aud is Cosmos DB.
+// With the app registration, an Entra caller needs no Cosmos DB token: the db tools get one on their behalf
+// (Artifact/CosmosOnBehalfOf.cs).
 var jwtConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId);
 var cosmosBearerConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId)
     && AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.Enabled;

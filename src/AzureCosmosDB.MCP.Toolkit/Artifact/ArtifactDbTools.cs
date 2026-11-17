@@ -4,8 +4,9 @@
 // with invalid_argument, as the Claude artifact `db` contract says.
 //
 // With COSMOS_TOKEN_PASSTHROUGH on (test only, CosmosTokenPassthrough.cs) the rules are off: each call reaches
-// Cosmos DB with the caller's own token, and Cosmos DB's role assignments alone decide. What it refuses fails with
-// permission_denied; a missing, expired or someone else's token fails with unauthenticated before Cosmos DB is called.
+// Cosmos DB as the caller, with a token got on their behalf for Entra callers (CosmosOnBehalfOf.cs) or their own pasted
+// one, and Cosmos DB's role assignments alone decide. What it refuses fails with permission_denied; a missing, expired
+// or someone else's token, or missing consent for on-behalf-of, fails with unauthenticated.
 //
 // Every write tells the artifact's open pages which collection changed (Changed, below): through Web PubSub, and to
 // this instance's /events subscribers.
@@ -170,6 +171,12 @@ public sealed class ArtifactDbTools
         catch (ArtifactDbException e)
         {
             return Fail(e.Code, e.Message);
+        }
+        catch (Exception e) when (CosmosOnBehalfOf.Failure(e) is { } error)
+        {
+            // Entra refused to exchange the caller's token (CosmosOnBehalfOf.cs). Never log the token itself.
+            logger.LogError(e, "Getting a Cosmos DB token on the caller's behalf failed");
+            return Fail(error.Code, error.Message);
         }
         catch (CosmosException e)
         {

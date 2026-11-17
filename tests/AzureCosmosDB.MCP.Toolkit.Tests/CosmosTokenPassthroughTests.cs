@@ -197,3 +197,85 @@ public class CosmosTokenPassthroughMcpTests : IClassFixture<McpTestApplicationFa
         }
     }
 }
+
+/// <summary>On-behalf-of: an Entra caller reaches Cosmos DB with a token got for them; everyone else still pastes one.</summary>
+[Collection("Environment variables")]
+public class CosmosOnBehalfOfTests
+{
+    private sealed class FakeCredential : Azure.Core.TokenCredential
+    {
+        private static readonly Azure.Core.AccessToken Token = new("cosmos-token", DateTimeOffset.UtcNow.AddHours(1));
+        public override Azure.Core.AccessToken GetToken(Azure.Core.TokenRequestContext r, CancellationToken c) => Token;
+        public override ValueTask<Azure.Core.AccessToken> GetTokenAsync(Azure.Core.TokenRequestContext r, CancellationToken c) => ValueTask.FromResult(Token);
+    }
+
+    private static readonly ArtifactViewer Jane = new("jane.doe@example.com", null, "jane.doe@example.com");
+
+    // A request as the Entra scheme (or another) leaves it: an authenticated identity and the bearer it came with.
+    private static Microsoft.AspNetCore.Http.HttpContext Caller(string authenticationType, string bearer, string? cosmosHeader = null)
+    {
+        var context = new Microsoft.AspNetCore.Http.DefaultHttpContext();
+        context.User = new System.Security.Claims.ClaimsPrincipal(new System.Security.Claims.ClaimsIdentity(
+            [new System.Security.Claims.Claim("exp", DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds().ToString())],
+            authenticationType));
+        context.Request.Headers.Authorization = "Bearer " + bearer;
+        if (cosmosHeader is not null) context.Request.Headers[CosmosTokenPassthrough.Header] = cosmosHeader;
+        return context;
+    }
+
+    private static void WithOnBehalfOf(Action<List<string>> test, string? clientId = "22222222-2222-2222-2222-222222222222")
+    {
+        var settings = new Dictionary<string, string?>
+        {
+            ["COSMOS_TOKEN_PASSTHROUGH"] = "true",
+            ["AzureAd__TenantId"] = "11111111-1111-1111-1111-111111111111",
+            ["AzureAd__ClientId"] = clientId,
+            ["COSMOS_ENDPOINT"] = "https://cosmos-alz-test.documents.azure.com:443/",
+        };
+        var exchanged = new List<string>();
+        var original = CosmosOnBehalfOf.CredentialFor;
+        CosmosOnBehalfOf.CredentialFor = bearer => { exchanged.Add(bearer); return new FakeCredential(); };
+        foreach (var (k, v) in settings) Environment.SetEnvironmentVariable(k, v);
+        try { test(exchanged); }
+        finally
+        {
+            CosmosOnBehalfOf.CredentialFor = original;
+            foreach (var k in settings.Keys) Environment.SetEnvironmentVariable(k, null);
+        }
+    }
+
+    [Fact]
+    public void An_entra_caller_is_exchanged_and_needs_no_pasted_token() => WithOnBehalfOf(exchanged =>
+    {
+        var bearer = "entra." + Guid.NewGuid().ToString("N") + ".sig";
+        ArtifactStore.For(Caller("Bearer", bearer, cosmosHeader: "ignored"), Jane).Should().NotBeSameAs(ArtifactStore.Shared);
+        exchanged.Should().Equal(bearer);
+    });
+
+    [Fact]
+    public void Ticket_callers_still_need_a_pasted_token() => WithOnBehalfOf(exchanged =>
+    {
+        var act = () => ArtifactStore.For(Caller(TicketAuthenticationHandler.SchemeName, "a.ticket"), Jane);
+        act.Should().Throw<ArtifactDbException>().Which.Code.Should().Be("unauthenticated");
+        exchanged.Should().BeEmpty();
+    });
+
+    [Fact]
+    public void Without_the_app_registration_entra_callers_need_a_pasted_token_too() => WithOnBehalfOf(exchanged =>
+    {
+        var act = () => ArtifactStore.For(Caller("Bearer", "entra.token.sig"), Jane);
+        act.Should().Throw<ArtifactDbException>().Which.Code.Should().Be("unauthenticated");
+        exchanged.Should().BeEmpty();
+    }, clientId: null);
+
+    [Fact]
+    public void Failed_exchanges_become_tool_errors()
+    {
+        CosmosOnBehalfOf.Failure(new Azure.Identity.AuthenticationFailedException("AADSTS65001: The user or administrator has not consented"))!
+            .Code.Should().Be("unauthenticated");
+        CosmosOnBehalfOf.Failure(new InvalidOperationException("wrapped",
+            new Azure.Identity.AuthenticationFailedException("AADSTS700213: No matching federated identity record found")))!
+            .Code.Should().Be("unavailable");
+        CosmosOnBehalfOf.Failure(new InvalidOperationException("something else")).Should().BeNull();
+    }
+}
