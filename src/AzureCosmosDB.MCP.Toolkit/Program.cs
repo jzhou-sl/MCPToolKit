@@ -251,6 +251,9 @@ if (cosmosBearerConfigured)
             ValidateIssuerSigningKey = true,
             ClockSkew = TimeSpan.FromSeconds(30),
             NameClaimType = "upn",
+            // The identity's AuthenticationType defaults to "AuthenticationTypes.Federation"; name it after this
+            // scheme so CosmosTokenPassthrough.VerifiedBearer recognises it and uses the bearer as the Cosmos DB token.
+            AuthenticationType = AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.SchemeName,
         };
     });
 }
