@@ -251,6 +251,9 @@ if (cosmosBearerConfigured)
             ValidateIssuerSigningKey = true,
             ClockSkew = TimeSpan.FromSeconds(30),
             NameClaimType = "upn",
+            // The identity's AuthenticationType defaults to "AuthenticationTypes.Federation"; name it after this
+            // scheme so CosmosTokenPassthrough.VerifiedBearer recognises it and uses the bearer as the Cosmos DB token.
+            AuthenticationType = AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.SchemeName,
         };
     });
 }
@@ -416,17 +419,19 @@ if (!devBypassAuth)
     }
     app.MapMcp("/mcp").RequireAuthorization();
     app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle).RequireAuthorization();
+    app.MapGet("/events/negotiate", (Delegate)AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactNegotiateEndpoint.Handle).RequireAuthorization();
     app.MapGet("/me", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactViewer.Me).RequireAuthorization();
 }
 else
 {
     app.MapMcp("/mcp");
     app.MapGet("/events", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactEventsEndpoint.Handle);
+    app.MapGet("/events/negotiate", (Delegate)AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactNegotiateEndpoint.Handle);
     app.MapGet("/me", AzureCosmosDB.MCP.Toolkit.Artifact.ArtifactViewer.Me);
 }
 
 // No web UI: the toolkit's tester (wwwroot, /api/mcp and /mcp/http) served its own tools without the artifact's
-// rules, /api/mcp without authentication, so it is removed. /mcp, /events and /health remain.
+// rules, /api/mcp without authentication, so it is removed. /mcp, /events, /events/negotiate and /health remain.
 
 app.Run();
 

@@ -1,15 +1,20 @@
 // Pushes "this collection changed" to the artifact's open pages, so their db listeners refresh at once instead of
-// polling. Pages subscribe through GET /events (server-sent events); each message names a collection, never data,
-// and the page re-reads through db_query, so the artifact's rules still decide what it sees.
+// polling. Each message names a collection, never data, and the page re-reads through db_query, so the artifact's
+// rules still decide what it sees. Two ways to listen:
+//   - GET /events/negotiate (ArtifactNegotiateEndpoint, below): a receive-only Web PubSub client URL. Deployed pages
+//     use this: they keep a WebSocket open to Web PubSub, which ArtifactDbTools tells about every write
+//     (ArtifactPubSub.cs), so the Function app can sleep while they're open. 404 when Web PubSub isn't configured.
+//   - GET /events: server-sent events from this instance, fed as described next. Used by the local host
+//     (src/local-host) and pages built without Web PubSub.
 //
-// Changes come from two places:
+// /events changes come from two places:
 //   - Cosmos DB's change feed (latest-version mode, from "now") of every container the artifact uses (the default
 //     one and ARTIFACT_CONTAINERS, ArtifactStore.cs), read every second while anyone is subscribed and stopped a
 //     minute after the last one leaves. It reports creates and updates made through any replica. It is always read
 //     with the server's managed identity, even with token passthrough on (it is a Data Reader then): it only ever
 //     publishes collection names, never data.
 //   - This replica's own writes (db_set, db_update, db_delete), published at once. The change feed doesn't report
-//     deletes, so a delete made through another replica reaches pages through their fallback polling.
+//     deletes, so a delete made through another replica reaches /events pages only when they next re-read.
 using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json.Nodes;
@@ -154,10 +159,14 @@ public static class ArtifactEventsEndpoint
 
     /// <summary>GET /events: server-sent events, one "change" per changed collection, for callers with a level (with
     /// token passthrough on, for anyone signed in: Cosmos DB, not their level, decides what they can read).</summary>
+    /// <summary>Who may hear about changes: callers with a level, or with token passthrough on, anyone signed in.</summary>
+    public static bool MayListen(ArtifactViewer viewer) =>
+        CosmosTokenPassthrough.Enabled ? viewer.Id is not null : viewer.Level is not null;
+
     public static async Task Handle(HttpContext context)
     {
         var viewer = ArtifactViewer.From(context.User);
-        if (CosmosTokenPassthrough.Enabled ? viewer.Id is null : viewer.Level is null)
+        if (!MayListen(viewer))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return;
@@ -197,6 +206,32 @@ public static class ArtifactEventsEndpoint
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             // the page went away
+        }
+    }
+}
+
+public static class ArtifactNegotiateEndpoint
+{
+    /// <summary>GET /events/negotiate: {"url": "wss://…"}, a Web PubSub client URL for this caller that joins the
+    /// instance's group and may only receive. Same access check as /events. 404 when Web PubSub isn't configured (the
+    /// page then uses /events); 503 when it couldn't be reached (the page retries).</summary>
+    public static async Task<IResult> Handle(HttpContext context)
+    {
+        var viewer = ArtifactViewer.From(context.User);
+        if (!ArtifactEventsEndpoint.MayListen(viewer) || viewer.Id is null) return Results.StatusCode(StatusCodes.Status403Forbidden);
+        if (ArtifactPubSub.Shared is not { } pubsub) return Results.NotFound();
+
+        context.Response.Headers.CacheControl = "no-store"; // the URL carries a token
+        try
+        {
+            var url = await pubsub.ClientUrlAsync(viewer.Id, context.RequestAborted);
+            return Results.Json(new { url = url.AbsoluteUri });
+        }
+        catch (Exception e) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            context.RequestServices.GetService<ILoggerFactory>()?.CreateLogger(typeof(ArtifactNegotiateEndpoint))
+                .LogError(e, "Getting a Web PubSub client URL failed");
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         }
     }
 }

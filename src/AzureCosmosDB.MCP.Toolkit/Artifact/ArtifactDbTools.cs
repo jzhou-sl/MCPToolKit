@@ -7,6 +7,9 @@
 // Cosmos DB with the caller's own token, and Cosmos DB's role assignments alone decide. What it refuses fails with
 // permission_denied; a missing, expired or someone else's token fails with unauthenticated before Cosmos DB is called.
 //
+// Every write tells the artifact's open pages which collection changed (Changed, below): through Web PubSub, and to
+// this instance's /events subscribers.
+//
 // Results: a snapshot is {id, path, exists, data?, version?, updatedAt?}; db_query returns {items: [snapshot]}.
 // Errors are tool results with isError and the text "<code>: <message>".
 using System.ComponentModel;
@@ -71,7 +74,7 @@ public sealed class ArtifactDbTools
             var body = ArtifactPaths.CheckBody(ToNode(data));
             DemandWrite(path, viewer);
             var record = await store.PutAsync(path, body, viewer.Id, cancellationToken);
-            Changed(path);
+            await Changed(path, logger);
             return Snapshot(path, record);
         });
 
@@ -89,7 +92,7 @@ public sealed class ArtifactDbTools
             DemandWrite(path, viewer);
             var record = await store.UpdateAsync(path, patch, viewer.Id, cancellationToken)
                 ?? throw ArtifactDbException.Invalid("update needs an existing document; use set to create one");
-            Changed(path);
+            await Changed(path, logger);
             return Snapshot(path, record);
         });
 
@@ -104,12 +107,29 @@ public sealed class ArtifactDbTools
             ArtifactPaths.Document(path);
             DemandWrite(path, viewer);
             await store.RemoveAsync(path, cancellationToken);
-            Changed(path);
+            await Changed(path, logger);
             return new JsonObject { ["deleted"] = path };
         });
 
-    // Tell this replica's open pages at once (and about deletes, which the change feed doesn't report).
-    private static void Changed(string path) => ArtifactEvents.Shared.Publish(ArtifactPaths.Parent(path));
+    /// <summary>After a write: tells every open page through Web PubSub (ArtifactPubSub.cs), whichever instance they
+    /// were served by, and this instance's /events subscribers (the local host, pages built without Web PubSub). Deletes
+    /// included, which the change feed doesn't report. The write has already succeeded, so a failure to tell anyone is
+    /// logged, never returned: pages catch up when they reconnect or the tab is shown again.</summary>
+    public static async Task Changed(string path, ILogger logger)
+    {
+        var collection = ArtifactPaths.Parent(path);
+        ArtifactEvents.Shared.Publish(collection);
+        if (ArtifactPubSub.Shared is not { } pubsub) return;
+        try
+        {
+            // Not the caller's token: if they go away after the write, the others still need telling.
+            await pubsub.PublishAsync(collection, CancellationToken.None);
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning(e, "Telling pages through Web PubSub that {Collection} changed failed", collection);
+        }
+    }
 
     private static bool Can(string path, string action, ArtifactViewer viewer) =>
         CosmosTokenPassthrough.Enabled || ArtifactRules.CanAccess(Rules.Value, path, action, viewer);
