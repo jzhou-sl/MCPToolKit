@@ -255,6 +255,13 @@ public class ArtifactDbToolsMcpTests : IClassFixture<McpTestApplicationFactory>
     }
 
     [Fact]
+    public async Task Negotiate_refuses_callers_without_a_level()
+    {
+        var response = await _client.GetAsync("/events/negotiate");
+        ((int)response.StatusCode).Should().Be(403);
+    }
+
+    [Fact]
     public async Task Bad_paths_are_invalid_arguments()
     {
         var result = await Call("db_get", new { path = "ideas" });
@@ -311,6 +318,86 @@ public class ArtifactEventsTests
             Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
         }
     }
+
+    private sealed class FakePubSub(bool fail = false) : IArtifactPubSub
+    {
+        public List<string> Users { get; } = [];
+        public List<string> Published { get; } = [];
+
+        public Task<Uri> ClientUrlAsync(string userId, CancellationToken cancellationToken)
+        {
+            Users.Add(userId);
+            return Task.FromResult(new Uri("wss://wps.example/client/hubs/artifact?access_token=t"));
+        }
+
+        public Task PublishAsync(string collection, CancellationToken cancellationToken)
+        {
+            if (fail) throw new InvalidOperationException("Web PubSub is down");
+            Published.Add(collection);
+            return Task.CompletedTask;
+        }
+    }
+
+    private static Microsoft.AspNetCore.Http.DefaultHttpContext ViewerContext() => new()
+    {
+        User = new ClaimsPrincipal(new ClaimsIdentity([new Claim("oid", "u1")], "Bearer")),
+        RequestServices = new ServiceCollection().AddLogging().BuildServiceProvider(),
+        Response = { Body = new MemoryStream() },
+    };
+
+    private static async Task WithViewerLevel(IArtifactPubSub? pubsub, Func<Task> test)
+    {
+        var saved = ArtifactPubSub.Shared;
+        Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "view");
+        ArtifactPubSub.Shared = pubsub;
+        try { await test(); }
+        finally
+        {
+            ArtifactPubSub.Shared = saved;
+            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
+        }
+    }
+
+    [Fact]
+    public Task Negotiate_is_not_found_without_web_pubsub() => WithViewerLevel(null, async () =>
+    {
+        var context = ViewerContext();
+        await (await ArtifactNegotiateEndpoint.Handle(context)).ExecuteAsync(context);
+        context.Response.StatusCode.Should().Be(404);
+    });
+
+    [Fact]
+    public Task Negotiate_gives_callers_with_a_level_a_client_url() => WithViewerLevel(new FakePubSub(), async () =>
+    {
+        var context = ViewerContext();
+        await (await ArtifactNegotiateEndpoint.Handle(context)).ExecuteAsync(context);
+
+        context.Response.StatusCode.Should().Be(200);
+        context.Response.Headers.CacheControl.ToString().Should().Be("no-store");
+        var body = JsonNode.Parse(Encoding.UTF8.GetString(((MemoryStream)context.Response.Body).ToArray()))!;
+        body["url"]!.GetValue<string>().Should().Be("wss://wps.example/client/hubs/artifact?access_token=t");
+        ((FakePubSub)ArtifactPubSub.Shared!).Users.Should().Equal(ArtifactViewer.From(context.User).Id);
+    });
+
+    [Fact]
+    public Task Writes_are_published_to_web_pubsub_and_local_subscribers() => WithViewerLevel(new FakePubSub(), async () =>
+    {
+        using var subscription = ArtifactEvents.Shared.Subscribe(readChangeFeed: false);
+        await ArtifactDbTools.Changed("ideas/i1", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+
+        ((FakePubSub)ArtifactPubSub.Shared!).Published.Should().Equal("ideas");
+        (await subscription.Reader.ReadAsync()).Should().Be("ideas");
+    });
+
+    [Fact]
+    public Task A_failing_web_pubsub_doesnt_fail_the_write() => WithViewerLevel(new FakePubSub(fail: true), async () =>
+    {
+        using var subscription = ArtifactEvents.Shared.Subscribe(readChangeFeed: false);
+        var changed = () => ArtifactDbTools.Changed("ideas/i1", Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+
+        await changed.Should().NotThrowAsync();
+        (await subscription.Reader.ReadAsync()).Should().Be("ideas");
+    });
 }
 
 /// <summary>The server with Entra authentication on, as deployed: how MCP clients such as Claude discover sign-in.</summary>
