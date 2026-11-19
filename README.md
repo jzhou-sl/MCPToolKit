@@ -7,8 +7,9 @@
 
 > **This fork** serves an artifact's database (Azure Landing Zone Artifacts) instead of the toolkit's own tools.
 > `/mcp` lists only `db_get`, `db_query`, `db_set`, `db_update` and `db_delete` (`src/AzureCosmosDB.MCP.Toolkit/Artifact/`),
-> which apply the artifact's rules (`ARTIFACT_RULES`) to each caller, at a level from their app role
-> (`Cosmos.Read`, `Cosmos.Write`, `Cosmos.Admin`; `ARTIFACT_OWNER_ID` is the owner). The transport is stateless, and
+> which reach Cosmos DB as each caller (on-behalf-of), so Cosmos DB's role assignments decide what they may do. Their
+> level (`/me`) is the owner's (`ARTIFACT_OWNER_ID`), an app role's (`Cosmos.Read`, `Cosmos.Write`, `Cosmos.Admin`) or
+> the highest role `ARTIFACT_COSMOS_ACCESS` gives them; callers with none are refused. The transport is stateless, and
 > `CORS_ALLOWED_ORIGINS` limits browsers to the artifact's site.
 
 A Model Context Protocol (MCP) server that enables AI agents to interact with Azure Cosmos DB through natural language queries. Features enterprise-grade security with Azure Entra ID authentication, document operations, vector search, hybrid search, and schema discovery.

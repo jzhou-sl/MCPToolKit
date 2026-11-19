@@ -10,64 +10,6 @@ using Xunit;
 
 namespace AzureCosmosDB.MCP.Toolkit.Tests;
 
-public class ArtifactRulesTests
-{
-    // The Ideas board's rules: everyone reads votes, each person writes only their own votes/<id>.
-    private static readonly IReadOnlyList<ArtifactRule> IdeasBoard = ArtifactRules.Validate(JsonNode.Parse("""
-        [{ "path": "votes", "read": "view", "write": "owner" }, { "path": "votes/{self}", "write": "interact" }]
-        """));
-
-    private static bool Can(string path, string action, string id, string level) =>
-        ArtifactRules.CanAccess(IdeasBoard, path, action, new ArtifactViewer(id, level));
-
-    [Fact]
-    public void Contributors_write_their_own_votes_only()
-    {
-        Can("votes/u1", "write", "u1", "interact").Should().BeTrue();
-        Can("votes/u2", "write", "u1", "interact").Should().BeFalse();
-        Can("votes/u2", "write", "u1", "owner").Should().BeTrue();
-    }
-
-    [Fact]
-    public void Viewers_read_everything_but_write_nothing()
-    {
-        Can("votes/u2", "read", "u1", "view").Should().BeTrue();
-        Can("ideas/i1", "read", "u1", "view").Should().BeTrue();
-        Can("ideas/i1", "write", "u1", "view").Should().BeFalse();
-        Can("votes/u1", "write", "u1", "view").Should().BeFalse();
-    }
-
-    [Fact]
-    public void Root_defaults_let_contributors_add_ideas()
-    {
-        Can("ideas/i1", "write", "u1", "interact").Should().BeTrue();
-    }
-
-    [Fact]
-    public void Users_subtrees_are_private_by_default()
-    {
-        Can("data/users/u1/notes/n1", "read", "u1", "view").Should().BeTrue();
-        Can("data/users/u2/notes/n1", "read", "u1", "admin").Should().BeFalse();
-    }
-
-    [Fact]
-    public void Callers_without_a_level_can_do_nothing()
-    {
-        ArtifactRules.CanAccess(IdeasBoard, "ideas/i1", "read", new ArtifactViewer("u1", null)).Should().BeFalse();
-    }
-
-    [Theory]
-    [InlineData("""[{ "path": "a", "read": "admin", "write": "view" }]""", "write is below read")]
-    [InlineData("""[{ "path": "a/{self}/b" }]""", "must be the last segment")]
-    [InlineData("""[{ "path": "a", "read": "boss" }]""", "must be one of")]
-    [InlineData("""[{ "path": "a" }, { "path": "a/" }]""", "two rules")]
-    public void Invalid_rules_are_refused(string rules, string message)
-    {
-        var act = () => ArtifactRules.Validate(JsonNode.Parse(rules));
-        act.Should().Throw<ArtifactDbException>().WithMessage($"*{message}*");
-    }
-}
-
 public class ArtifactQueryTests
 {
     private static ArtifactRecord Doc(string id, string json) =>
@@ -162,20 +104,27 @@ public class ArtifactViewerTests
     }
 
     [Fact]
-    public void Signed_in_callers_without_a_role_get_the_default_level()
+    public void Levels_come_from_the_highest_cosmos_access_role()
     {
         try
         {
-            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "interact");
-            ArtifactViewer.From(User("u1")).Level.Should().Be("interact");
-            ArtifactViewer.From(User("u1", "Cosmos.Read")).Level.Should().Be("view");
-            ArtifactViewer.From(new ClaimsPrincipal(new ClaimsIdentity())).Level.Should().BeNull();
-            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "owner");
-            ArtifactViewer.From(User("u1")).Level.Should().BeNull();
+            Environment.SetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS", """
+                [{ "users": ["Jane@Example.com", "U2"], "role": "view", "containers": ["docs"] },
+                 { "users": ["jane@example.com"], "role": "interact", "containers": ["votes"] },
+                 { "users": ["u3"], "role": "owner", "containers": ["*"] }]
+                """);
+            var jane = new ClaimsPrincipal(new ClaimsIdentity([new Claim("oid", "u1"), new Claim("preferred_username", "jane@example.com")], "Bearer"));
+            ArtifactViewer.From(jane).Level.Should().Be("interact");
+            ArtifactViewer.From(User("u2")).Level.Should().Be("view");                  // by object ID
+            ArtifactViewer.From(User("u3")).Level.Should().BeNull();                    // not a cosmos.access role
+            ArtifactViewer.From(User("u4")).Level.Should().BeNull();                    // not listed
+            ArtifactViewer.From(User("u4", "Cosmos.Read")).Level.Should().Be("view");   // app roles still count
+            Environment.SetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS", "not json");
+            ArtifactViewer.From(jane).Level.Should().BeNull();
         }
         finally
         {
-            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
+            Environment.SetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS", null);
         }
     }
 }
@@ -217,20 +166,16 @@ public class ArtifactDbToolsMcpTests : IClassFixture<McpTestApplicationFactory>
         tools.Should().BeEquivalentTo("db_get", "db_query", "db_set", "db_update", "db_delete");
     }
 
-    [Fact]
-    public async Task An_unreadable_document_looks_absent()
+    [Theory]
+    [InlineData("db_get")]
+    [InlineData("db_query")]
+    [InlineData("db_set")]
+    [InlineData("db_delete")]
+    public async Task Calls_from_someone_not_signed_in_are_unauthenticated(string tool)
     {
-        var result = await Call("db_get", new { path = "ideas/i1" });
-        result["isError"]?.GetValue<bool>().Should().NotBe(true);
-        result["structuredContent"]!["exists"]!.GetValue<bool>().Should().BeFalse();
-    }
-
-    [Fact]
-    public async Task A_write_without_a_level_is_refused()
-    {
-        var result = await Call("db_set", new { path = "ideas/i1", data = new { text = "hi" } });
+        var result = await Call(tool, new { path = "ideas/i1", collection = "ideas", data = new { text = "hi" } });
         result["isError"]!.GetValue<bool>().Should().BeTrue();
-        result["content"]![0]!["text"]!.GetValue<string>().Should().StartWith("invalid_argument: ");
+        result["content"]![0]!["text"]!.GetValue<string>().Should().StartWith("unauthenticated: ");
     }
 
     [Theory]
@@ -261,13 +206,6 @@ public class ArtifactDbToolsMcpTests : IClassFixture<McpTestApplicationFactory>
         ((int)response.StatusCode).Should().Be(403);
     }
 
-    [Fact]
-    public async Task Bad_paths_are_invalid_arguments()
-    {
-        var result = await Call("db_get", new { path = "ideas" });
-        result["isError"]!.GetValue<bool>().Should().BeTrue();
-        result["content"]![0]!["text"]!.GetValue<string>().Should().StartWith("invalid_argument: a document path");
-    }
 }
 
 [Collection("Environment variables")] // these tests set process-wide settings, so they run one at a time
@@ -289,7 +227,7 @@ public class ArtifactEventsTests
     [Fact]
     public async Task Events_stream_changes_to_callers_with_a_level()
     {
-        Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "view");
+        Environment.SetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS", """[{"users":["u1"],"role":"view","containers":["docs"]}]""");
         try
         {
             var context = new Microsoft.AspNetCore.Http.DefaultHttpContext
@@ -315,7 +253,7 @@ public class ArtifactEventsTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
+            Environment.SetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS", null);
         }
     }
 
@@ -348,13 +286,13 @@ public class ArtifactEventsTests
     private static async Task WithViewerLevel(IArtifactPubSub? pubsub, Func<Task> test)
     {
         var saved = ArtifactPubSub.Shared;
-        Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", "view");
+        Environment.SetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS", """[{"users":["u1"],"role":"view","containers":["docs"]}]""");
         ArtifactPubSub.Shared = pubsub;
         try { await test(); }
         finally
         {
             ArtifactPubSub.Shared = saved;
-            Environment.SetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL", null);
+            Environment.SetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS", null);
         }
     }
 
@@ -569,10 +507,14 @@ public class TicketAuthenticationTests : IClassFixture<AuthEnabledApplicationFac
     });
 
     [Fact]
-    public void Levels_come_from_the_owner_email_and_the_access_list() => WithSettings(new()
+    public void Levels_come_from_the_owner_email_and_cosmos_access() => WithSettings(new()
     {
         ["ARTIFACT_OWNER_EMAIL"] = "Owner@Example.com",
-        ["ARTIFACT_ACCESS"] = """{"editors":["ed@example.com"],"contributors":["Con@Example.com"],"viewers":["vi@other.org"]}""",
+        ["ARTIFACT_COSMOS_ACCESS"] = """
+            [{"users":["ed@example.com"],"role":"admin","containers":["*"]},
+             {"users":["Con@Example.com"],"role":"interact","containers":["docs"]},
+             {"users":["vi@other.org"],"role":"view","containers":["docs"]}]
+            """,
     }, () =>
     {
         var owner = Viewer("owner@example.com");
@@ -583,26 +525,13 @@ public class TicketAuthenticationTests : IClassFixture<AuthEnabledApplicationFac
         Viewer("con@example.com").Level.Should().Be("interact");
         Viewer("vi@other.org").Level.Should().Be("view");
         Viewer("someone@example.com").Level.Should().BeNull();
-    });
-
-    [Fact]
-    public void The_default_level_is_only_for_allowed_domains() => WithSettings(new()
-    {
-        ["ARTIFACT_DEFAULT_LEVEL"] = "interact",
-        ["ARTIFACT_EMAIL_DOMAINS"] = "example.com, example.co.uk",
-    }, () =>
-    {
-        Viewer("jane.doe@example.com").Level.Should().Be("interact");
         Viewer("jane.doe@example.com").Name.Should().Be("Jane Doe");
-        Viewer("j@example.co.uk").Level.Should().Be("interact");
-        Viewer("j@gmail.com").Level.Should().BeNull();
-        Viewer("j@notexample.com").Level.Should().BeNull();
     });
 
     [Fact]
     public void Entra_tokens_are_identified_by_email_too() => WithSettings(new()
     {
-        ["ARTIFACT_ACCESS"] = """{"contributors":["jane@example.com"]}""",
+        ["ARTIFACT_COSMOS_ACCESS"] = """[{"users":["jane@example.com"],"role":"interact","containers":["docs"]}]""",
     }, () =>
     {
         var user = new ClaimsPrincipal(new ClaimsIdentity(
@@ -651,5 +580,26 @@ public class TicketAuthenticationTests : IClassFixture<AuthEnabledApplicationFac
     {
         var response = await Get("/me", null);
         response.Headers.WwwAuthenticate.ToString().Should().Contain("scope=");
+    });
+
+    [Fact]
+    public async Task Someone_signed_in_but_not_in_cosmos_access_is_refused_before_cosmos_db() => await WithSettingsAsync(async () =>
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
+        {
+            Content = new StringContent(JsonSerializer.Serialize(new
+            {
+                jsonrpc = "2.0", id = 1, method = "tools/call",
+                @params = new { name = "db_get", arguments = new { path = "ideas/i1" } },
+            }), Encoding.UTF8, "application/json"),
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Ticket("stranger@example.com"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+        var text = await (await _client.SendAsync(request)).Content.ReadAsStringAsync();
+        var json = text.TrimStart().StartsWith('{') ? text : text.Split('\n').First(l => l.StartsWith("data:"))["data:".Length..];
+        var result = JsonNode.Parse(json)!["result"]!;
+        result["isError"]!.GetValue<bool>().Should().BeTrue();
+        result["content"]![0]!["text"]!.GetValue<string>().Should().StartWith("permission_denied: ");
     });
 }
