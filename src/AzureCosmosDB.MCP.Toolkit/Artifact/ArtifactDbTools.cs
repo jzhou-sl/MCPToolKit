@@ -1,12 +1,12 @@
-// The artifact database as MCP tools, for the artifact's page (window.claude's db) and for agents. Every call is
-// checked against the artifact's rules (ARTIFACT_RULES: capabilities.json's db.rules, as JSON) for the signed-in
-// caller (ArtifactViewer). A document the caller may not read looks absent; a write they may not make fails
-// with invalid_argument, as the Claude artifact `db` contract says.
+// The artifact database as MCP tools, for the artifact's page (window.claude's db) and for agents. Each call reaches
+// Cosmos DB as the caller (ArtifactStore.For), with a token got on their behalf for Entra callers (CosmosOnBehalfOf.cs)
+// or their own (CosmosTokenPassthrough.cs), so Cosmos DB's role assignments, from policy.json's cosmos.access, alone
+// decide what they may do. There are no per-document rules: those roles stop at the container.
 //
-// With COSMOS_TOKEN_PASSTHROUGH on (test only, CosmosTokenPassthrough.cs) the rules are off: each call reaches
-// Cosmos DB as the caller, with a token got on their behalf for Entra callers (CosmosOnBehalfOf.cs) or their own pasted
-// one, and Cosmos DB's role assignments alone decide. What it refuses fails with permission_denied; a missing, expired
-// or someone else's token, or missing consent for on-behalf-of, fails with unauthenticated.
+// A caller who isn't signed in fails with unauthenticated, and one with no level (not the owner, not in
+// cosmos.access; ArtifactViewer) with permission_denied, before Cosmos DB is asked. What Cosmos DB refuses fails with
+// permission_denied; a missing, expired or someone else's token, or missing consent for on-behalf-of, with
+// unauthenticated.
 //
 // Every write tells the artifact's open pages which collection changed (Changed, below): through Web PubSub, and to
 // this instance's /events subscribers.
@@ -25,13 +25,10 @@ namespace AzureCosmosDB.MCP.Toolkit.Artifact;
 [McpServerToolType]
 public sealed class ArtifactDbTools
 {
-    private static readonly Lazy<IReadOnlyList<ArtifactRule>> Rules = new(() =>
-        ArtifactRules.Validate(JsonNode.Parse(Environment.GetEnvironmentVariable("ARTIFACT_RULES") ?? "[]")));
-
     private const string PathDescription = "Document path: an even number of /-separated segments, e.g. tasks/t1";
 
     [McpServerTool(Name = "db_get", ReadOnly = true, Idempotent = true)]
-    [Description("Read one document. A document you may not read looks absent.")]
+    [Description("Read one document.")]
     public static Task<CallToolResult> DbGet(
         IHttpContextAccessor http, ILogger<ArtifactDbTools> logger,
         [Description(PathDescription)] string path,
@@ -39,12 +36,11 @@ public sealed class ArtifactDbTools
         Run(http, logger, async (viewer, store) =>
         {
             ArtifactPaths.Document(path);
-            var record = Can(path, "read", viewer) ? await store.GetAsync(path, cancellationToken) : null;
-            return Snapshot(path, record);
+            return Snapshot(path, await store.GetAsync(path, cancellationToken));
         });
 
     [McpServerTool(Name = "db_query", ReadOnly = true, Idempotent = true)]
-    [Description("List documents in a collection, optionally filtered (==, !=, <, <=, >, >=, in, not-in, array-contains on top-level fields), ordered and limited. Only documents you may read are returned.")]
+    [Description("List documents in a collection, optionally filtered (==, !=, <, <=, >, >=, in, not-in, array-contains on top-level fields), ordered and limited.")]
     public static Task<CallToolResult> DbQuery(
         IHttpContextAccessor http, ILogger<ArtifactDbTools> logger,
         [Description("Collection path: an odd number of segments, e.g. tasks")] string collection,
@@ -56,9 +52,8 @@ public sealed class ArtifactDbTools
         {
             ArtifactPaths.Collection(collection);
             var query = ArtifactQuery.Check(ToNode(where), ToNode(orderBy), limit);
-            var readable = (await store.ListAsync(collection, cancellationToken)).Where(r => Can(r.Path, "read", viewer));
             var items = new JsonArray();
-            foreach (var r in ArtifactQuery.Run(readable, query)) items.Add(Snapshot(r.Path, r));
+            foreach (var r in ArtifactQuery.Run(await store.ListAsync(collection, cancellationToken), query)) items.Add(Snapshot(r.Path, r));
             return new JsonObject { ["items"] = items };
         });
 
@@ -73,7 +68,6 @@ public sealed class ArtifactDbTools
         {
             ArtifactPaths.Document(path);
             var body = ArtifactPaths.CheckBody(ToNode(data));
-            DemandWrite(path, viewer);
             var record = await store.PutAsync(path, body, viewer.Id, cancellationToken);
             await Changed(path, logger);
             return Snapshot(path, record);
@@ -90,7 +84,6 @@ public sealed class ArtifactDbTools
         {
             ArtifactPaths.Document(path);
             var patch = ArtifactPaths.CheckBody(ToNode(data));
-            DemandWrite(path, viewer);
             var record = await store.UpdateAsync(path, patch, viewer.Id, cancellationToken)
                 ?? throw ArtifactDbException.Invalid("update needs an existing document; use set to create one");
             await Changed(path, logger);
@@ -106,7 +99,6 @@ public sealed class ArtifactDbTools
         Run(http, logger, async (viewer, store) =>
         {
             ArtifactPaths.Document(path);
-            DemandWrite(path, viewer);
             await store.RemoveAsync(path, cancellationToken);
             await Changed(path, logger);
             return new JsonObject { ["deleted"] = path };
@@ -132,15 +124,6 @@ public sealed class ArtifactDbTools
         }
     }
 
-    private static bool Can(string path, string action, ArtifactViewer viewer) =>
-        CosmosTokenPassthrough.Enabled || ArtifactRules.CanAccess(Rules.Value, path, action, viewer);
-
-    private static void DemandWrite(string path, ArtifactViewer viewer)
-    {
-        // The contract has no permission-denied code: a write below the minimum level is invalid_argument.
-        if (!Can(path, "write", viewer)) throw ArtifactDbException.Invalid("you may not write here");
-    }
-
     public static JsonObject Snapshot(string path, ArtifactRecord? record)
     {
         var snap = new JsonObject { ["id"] = ArtifactPaths.Id(path), ["path"] = path, ["exists"] = record is not null };
@@ -161,6 +144,8 @@ public sealed class ArtifactDbTools
         try
         {
             var viewer = ArtifactViewer.From(http.HttpContext?.User);
+            if (viewer.Id is null) throw new ArtifactDbException("unauthenticated", "sign in first");
+            if (viewer.Level is null) throw new ArtifactDbException("permission_denied", "you have no access to this artifact");
             var result = await work(viewer, ArtifactStore.For(http.HttpContext, viewer));
             return new CallToolResult
             {

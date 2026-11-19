@@ -1,16 +1,18 @@
 // Who is calling and their level. A caller is identified by their sign-in email, lower-cased (their Entra object ID
-// only when the token carries no email), so the same person has the same ID whether they come through the artifact's
-// Static Web App (a ticket, TicketAuthentication.cs) or with an Entra token (Claude).
+// only when the token carries no email), so the same person has the same ID whether they come with a ticket
+// (TicketAuthentication.cs) or with an Entra token (the page, Claude).
 //
 // Their level, first match wins:
 //   owner     the principal that deployed the instance: ARTIFACT_OWNER_ID (object ID) or ARTIFACT_OWNER_EMAIL
 //   app roles on the MCP server API, for Entra tokens only: Cosmos.Admin → admin, Cosmos.Write → interact,
 //             Cosmos.Read → view
-//   ARTIFACT_ACCESS, the access list from the instance's policy.json: {"editors": [emails], "contributors": [...],
-//             "viewers": [...]} → admin, interact, view
-//   ARTIFACT_DEFAULT_LEVEL (view, interact or admin) for anyone else signed in. Through the Static Web App, whose
-//             sign-in admits any Microsoft account, only for emails in ARTIFACT_EMAIL_DOMAINS (comma-separated)
-// Otherwise they have no level and can neither read nor write.
+//   ARTIFACT_COSMOS_ACCESS, policy.json's cosmos.access as JSON: [{"users": [emails or object IDs], "role": "view" |
+//             "interact" | "admin", "containers": [...]}]. The highest role of any entry naming them, so the level
+//             says what the Cosmos DB role assignments made from the same list let them do.
+// Otherwise they have no level: the db tools and change events refuse them.
+//
+// The level doesn't grant anything in Cosmos DB, which the db tools reach as the caller: its role assignments decide.
+// It is what /me reports, so the page can show or hide what the person may do.
 using System.Security.Claims;
 using System.Text.Json;
 
@@ -20,22 +22,23 @@ public sealed record ArtifactViewer(string? Id, string? Level, string? Email = n
 {
     private const string ObjectIdClaim = "http://schemas.microsoft.com/identity/claims/objectidentifier";
     private static readonly string[] EmailClaims = ["email", "preferred_username", "upn", "unique_name"];
+    private static readonly string[] Levels = ["view", "interact", "admin"]; // lowest first
 
     public static ArtifactViewer From(ClaimsPrincipal? user)
     {
         if (user?.Identity?.IsAuthenticated != true) return new ArtifactViewer(null, null);
-        var throughStaticWebApp = user.Identity.AuthenticationType == TicketAuthenticationHandler.SchemeName;
+        var throughTicket = user.Identity.AuthenticationType == TicketAuthenticationHandler.SchemeName;
         var oid = user.FindFirst("oid")?.Value ?? user.FindFirst(ObjectIdClaim)?.Value;
         var email = EmailClaims.Select(c => user.FindFirst(c)?.Value).FirstOrDefault(v => v is not null && v.Contains('@'))
             ?.Trim().ToLowerInvariant();
-        var roles = throughStaticWebApp ? new HashSet<string>() : user.FindAll("roles").Select(c => c.Value).ToHashSet();
+        var roles = throughTicket ? new HashSet<string>() : user.FindAll("roles").Select(c => c.Value).ToHashSet();
 
         string? level =
             IsOwner(oid, email) ? "owner"
             : roles.Contains("Cosmos.Admin") ? "admin"
             : roles.Contains("Cosmos.Write") ? "interact"
             : roles.Contains("Cosmos.Read") ? "view"
-            : Listed(email) ?? (throughStaticWebApp && !InAllowedDomain(email) ? null : DefaultLevel());
+            : Listed(email, oid);
         var name = user.FindFirst("name")?.Value;
         return new ArtifactViewer(email ?? oid, level, email, string.IsNullOrWhiteSpace(name) ? NameFrom(email) : name);
     }
@@ -56,62 +59,53 @@ public sealed record ArtifactViewer(string? Id, string? Level, string? Email = n
     private static bool Same(string? a, string? b) =>
         !string.IsNullOrWhiteSpace(a) && string.Equals(a, b?.Trim(), StringComparison.OrdinalIgnoreCase);
 
-    private static string? Listed(string? email)
+    // The highest role cosmos.access gives them, by email or object ID.
+    private static string? Listed(string? email, string? oid)
     {
-        if (email is null) return null;
-        foreach (var (group, level) in new[] { ("editors", "admin"), ("contributors", "interact"), ("viewers", "view") })
+        var best = -1;
+        foreach (var (users, role) in Access())
         {
-            if (Access().TryGetValue(group, out var members) && members.Contains(email)) return level;
+            if ((email is not null && users.Contains(email)) || (oid is not null && users.Contains(oid.ToLowerInvariant())))
+                best = Math.Max(best, Array.IndexOf(Levels, role));
         }
-        return null;
+        return best < 0 ? null : Levels[best];
     }
 
-    private sealed record AccessList(string Source, Dictionary<string, HashSet<string>> Groups);
-    private static AccessList access = new("", new Dictionary<string, HashSet<string>>());
+    private sealed record Entry(HashSet<string> Users, string Role);
+    private sealed record AccessList(string Source, List<Entry> Entries);
+    private static AccessList access = new("", []);
 
-    // ARTIFACT_ACCESS, parsed once per value. Anything malformed grants nothing.
-    private static Dictionary<string, HashSet<string>> Access()
+    private sealed record EntryJson(string[]? Users, string? Role);
+
+    // ARTIFACT_COSMOS_ACCESS, parsed once per value. Anything malformed grants nothing; an unknown role is skipped.
+    private static IEnumerable<(HashSet<string> Users, string Role)> Access()
     {
-        var source = Environment.GetEnvironmentVariable("ARTIFACT_ACCESS") ?? "";
+        var source = Environment.GetEnvironmentVariable("ARTIFACT_COSMOS_ACCESS") ?? "";
         var cached = access;
-        if (source == cached.Source) return cached.Groups;
-        var parsed = new Dictionary<string, HashSet<string>>();
-        try
+        if (source != cached.Source)
         {
-            if (!string.IsNullOrWhiteSpace(source)
-                && JsonSerializer.Deserialize<Dictionary<string, string[]>>(source) is { } groups)
+            var parsed = new List<Entry>();
+            try
             {
-                foreach (var (group, members) in groups)
+                var entries = string.IsNullOrWhiteSpace(source) ? null
+                    : JsonSerializer.Deserialize<EntryJson[]>(source, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                foreach (var e in entries ?? [])
                 {
-                    parsed[group] = members.Where(m => !string.IsNullOrWhiteSpace(m))
-                        .Select(m => m.Trim().ToLowerInvariant()).ToHashSet();
+                    if (e?.Role is not { } role || !Levels.Contains(role)) continue;
+                    var users = (e.Users ?? []).Where(u => !string.IsNullOrWhiteSpace(u)).Select(u => u.Trim().ToLowerInvariant()).ToHashSet();
+                    parsed.Add(new Entry(users, role));
                 }
             }
+            catch (JsonException)
+            {
+                parsed.Clear();
+            }
+            cached = access = new AccessList(source, parsed);
         }
-        catch (JsonException)
-        {
-            parsed.Clear();
-        }
-        access = new AccessList(source, parsed);
-        return parsed;
+        return cached.Entries.Select(e => (e.Users, e.Role));
     }
 
-    private static bool InAllowedDomain(string? email)
-    {
-        if (email is null) return false;
-        var domain = email[(email.LastIndexOf('@') + 1)..];
-        return (Environment.GetEnvironmentVariable("ARTIFACT_EMAIL_DOMAINS") ?? "")
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Any(d => string.Equals(d, domain, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static string? DefaultLevel()
-    {
-        var level = Environment.GetEnvironmentVariable("ARTIFACT_DEFAULT_LEVEL");
-        return level is "view" or "interact" or "admin" ? level : null;
-    }
-
-    // "jane.doe@example.com" → "Jane Doe": the Static Web App passes no display name.
+    // "jane.doe@example.com" → "Jane Doe": a ticket carries no display name.
     private static string? NameFrom(string? email) =>
         email is null ? null
         : string.Join(' ', email[..email.IndexOf('@')].Split('.', '_', '-')

@@ -105,9 +105,8 @@ public class CosmosTokenPassthroughTests
 
     // Claude Code sends the Cosmos DB token as its bearer token; such requests go to the CosmosToken scheme.
     [Fact]
-    public void A_cosmos_db_bearer_token_is_recognised_only_with_passthrough_on()
-    {
-        WithSettings(new() { ["COSMOS_TOKEN_PASSTHROUGH"] = "true", ["COSMOS_ENDPOINT"] = Endpoint }, () =>
+    public void A_cosmos_db_bearer_token_is_recognised() =>
+        WithSettings(new() { ["COSMOS_ENDPOINT"] = Endpoint }, () =>
         {
             IsCosmosBearer("Bearer " + Token()).Should().BeTrue();
             IsCosmosBearer("Bearer " + Token(aud: "https://cosmos-alz-test.documents.azure.com:443/")).Should().BeTrue();
@@ -116,9 +115,6 @@ public class CosmosTokenPassthroughTests
             IsCosmosBearer("Bearer not.a.jwt").Should().BeFalse();
             IsCosmosBearer(null).Should().BeFalse();
         });
-        WithSettings(new() { ["COSMOS_ENDPOINT"] = Endpoint }, () =>
-            IsCosmosBearer("Bearer " + Token()).Should().BeFalse());
-    }
 
     [Fact]
     public void Top_level_collections_named_in_artifact_containers_have_their_own() =>
@@ -153,51 +149,6 @@ public class CosmosTokenPassthroughTests
     }
 }
 
-/// <summary>The tools with passthrough on: without a Cosmos DB token, a call fails before Cosmos DB is reached.</summary>
-[Collection("Environment variables")]
-public class CosmosTokenPassthroughMcpTests : IClassFixture<McpTestApplicationFactory>
-{
-    private readonly HttpClient _client;
-
-    public CosmosTokenPassthroughMcpTests(McpTestApplicationFactory factory)
-    {
-        _client = factory.CreateClient();
-    }
-
-    private async Task<JsonNode> Call(string name, object arguments)
-    {
-        var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
-        {
-            Content = new StringContent(JsonSerializer.Serialize(new { jsonrpc = "2.0", id = 1, method = "tools/call", @params = new { name, arguments } }),
-                Encoding.UTF8, "application/json"),
-        };
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-        var text = await (await _client.SendAsync(request)).Content.ReadAsStringAsync();
-        var json = text.TrimStart().StartsWith('{') ? text : text.Split('\n').First(l => l.StartsWith("data:"))["data:".Length..];
-        return JsonNode.Parse(json)!["result"]!;
-    }
-
-    [Theory]
-    [InlineData("db_get")]
-    [InlineData("db_set")]
-    [InlineData("db_delete")]
-    public async Task Calls_without_a_token_are_unauthenticated(string tool)
-    {
-        Environment.SetEnvironmentVariable("COSMOS_TOKEN_PASSTHROUGH", "true");
-        try
-        {
-            var result = await Call(tool, new { path = "ideas/i1", data = new { text = "hi" } });
-            result["isError"]!.GetValue<bool>().Should().BeTrue();
-            result["content"]![0]!["text"]!.GetValue<string>().Should().StartWith("unauthenticated: ");
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("COSMOS_TOKEN_PASSTHROUGH", null);
-        }
-    }
-}
-
 /// <summary>On-behalf-of: an Entra caller reaches Cosmos DB with a token got for them; everyone else still pastes one.</summary>
 [Collection("Environment variables")]
 public class CosmosOnBehalfOfTests
@@ -227,7 +178,6 @@ public class CosmosOnBehalfOfTests
     {
         var settings = new Dictionary<string, string?>
         {
-            ["COSMOS_TOKEN_PASSTHROUGH"] = "true",
             ["AzureAd__TenantId"] = "11111111-1111-1111-1111-111111111111",
             ["AzureAd__ClientId"] = clientId,
             ["COSMOS_ENDPOINT"] = "https://cosmos-alz-test.documents.azure.com:443/",

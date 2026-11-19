@@ -1,11 +1,11 @@
-// Token passthrough (test only): the db tools call Cosmos DB as the person using the page, with a Cosmos DB access
-// token they got from the Azure CLI and pasted into the page, so Cosmos DB's own role assignments (per container,
-// from policy.json's "cosmos" section) decide what they may read, write and delete. A stand-in for on-behalf-of until
-// there's an app registration; see docs/cosmos-token-passthrough.md.
+// A caller's own Cosmos DB token: the fallback for callers without an Entra token for the MCP server's API, who can't
+// be served on-behalf-of (CosmosOnBehalfOf.cs). The db tools always call Cosmos DB as the caller, so Cosmos DB's role
+// assignments (per container, from policy.json's cosmos.access) decide what they may read, write and delete; see
+// docs/cosmos-token-passthrough.md.
 //
-// It breaks the MCP spec's rule that a server only accepts tokens issued for itself, so it is off unless
-// COSMOS_TOKEN_PASSTHROUGH is true, and isn't meant to ship. When it is on:
-//   - The page sends the token in the X-Cosmos-Token header next to its ticket, which still says who is signed in.
+// It breaks the MCP spec's rule that a server only accepts tokens issued for itself, and no deployed page sends one.
+// How it works:
+//   - The caller sends the token in the X-Cosmos-Token header next to its ticket, which still says who is signed in.
 //   - The token's signature isn't checked here: Cosmos DB checks it on every call. This only refuses tokens that
 //     can't be the caller's own: tid must be this tenant (AzureAd__TenantId), exp in the future, aud Cosmos DB
 //     (its application ID, as Azure CLI tokens have it, or https://cosmos.azure.com or this account's endpoint,
@@ -15,14 +15,14 @@
 //   - There is no fallback to the server's managed identity, which only reads the change feed for /events.
 // The token is never logged.
 //
-// Claude Code (no app registration yet): with passthrough on, a caller may send the Cosmos DB token itself as
+// Claude Code without the app registration: a caller may send the Cosmos DB token itself as
 // "Authorization: Bearer <token>" instead of a ticket. Then it also says who is calling, so it is NOT taken on trust:
 // Program.cs routes such a bearer (IsCosmosBearer) to the "CosmosToken" JwtBearer scheme, which checks its signature,
 // issuer (this tenant) and audience (Audiences) against Entra. ArtifactStore.For then uses that bearer as the Cosmos
 // DB token when there's no X-Cosmos-Token header. See docs/cosmos-token-passthrough.md, "Claude Code".
 //
 // With the app registration, Entra callers need none of this: on-behalf-of (CosmosOnBehalfOf.cs) gets their Cosmos DB
-// token for them. Passthrough remains for the page's tickets, which can't be exchanged.
+// token for them. This remains for tickets, which can't be exchanged.
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
@@ -40,9 +40,6 @@ public static class CosmosTokenPassthrough
     private const int MaxTokenLength = 16 * 1024;
     private static readonly TimeSpan ClockSkew = TimeSpan.FromSeconds(30);
     private static readonly string[] EmailClaims = ["upn", "preferred_username", "unique_name", "email"];
-
-    public static bool Enabled =>
-        bool.TryParse(Environment.GetEnvironmentVariable("COSMOS_TOKEN_PASSTHROUGH"), out var on) && on;
 
     public sealed record TokenClaims(string Email, DateTimeOffset Expires);
 
@@ -103,12 +100,11 @@ public static class CosmosTokenPassthrough
     }
 
     /// <summary>
-    /// Whether, with passthrough on, the bearer token is a JWT whose (unverified) aud is Cosmos DB: the request is then
+    /// Whether the bearer token is a JWT whose (unverified) aud is Cosmos DB: the request is then
     /// for the CosmosToken scheme, which verifies it. Tickets have two parts, so they never match.
     /// </summary>
     public static bool IsCosmosBearer(HttpRequest request)
     {
-        if (!Enabled) return false;
         var header = request.Headers.Authorization.ToString();
         if (!header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return false;
         var token = header[7..].Trim();

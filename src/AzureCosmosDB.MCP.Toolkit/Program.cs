@@ -207,15 +207,14 @@ else
 // token, like Claude's Entra tokens; tickets have two dot-separated parts and JWTs three, which picks the scheme.
 // Tickets work without the MCP server API registration above, which only Claude needs.
 //
-// With COSMOS_TOKEN_PASSTHROUGH on (test only), Claude Code can instead send the person's own Cosmos DB token from the
+// Without the app registration, Claude Code can instead send the person's own Cosmos DB token from the
 // Azure CLI as its bearer token, with no app registration (docs/cosmos-token-passthrough.md, "Claude Code"). That
 // token then says who is calling, so the "CosmosToken" scheme verifies it against Entra: signature, this tenant as
 // issuer, a Cosmos DB audience, lifetime. A bearer goes there when its aud is Cosmos DB.
 // With the app registration, an Entra caller needs no Cosmos DB token: the db tools get one on their behalf
 // (Artifact/CosmosOnBehalfOf.cs).
 var jwtConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(clientId);
-var cosmosBearerConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId)
-    && AzureCosmosDB.MCP.Toolkit.Artifact.CosmosTokenPassthrough.Enabled;
+var cosmosBearerConfigured = !devBypassAuth && !string.IsNullOrEmpty(tenantId);
 var authentication = builder.Services
     .AddAuthentication(options =>
     {

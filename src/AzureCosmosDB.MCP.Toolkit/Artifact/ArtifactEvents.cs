@@ -1,6 +1,6 @@
 // Pushes "this collection changed" to the artifact's open pages, so their db listeners refresh at once instead of
-// polling. Each message names a collection, never data, and the page re-reads through db_query, so the artifact's
-// rules still decide what it sees. Two ways to listen:
+// polling. Each message names a collection, never data, and the page re-reads through db_query, so Cosmos DB
+// still decides what it sees. Two ways to listen:
 //   - GET /events/negotiate (ArtifactNegotiateEndpoint, below): a receive-only Web PubSub client URL. Deployed pages
 //     use this: they keep a WebSocket open to Web PubSub, which ArtifactDbTools tells about every write
 //     (ArtifactPubSub.cs), so the Function app can sleep while they're open. 404 when Web PubSub isn't configured.
@@ -10,9 +10,8 @@
 // /events changes come from two places:
 //   - Cosmos DB's change feed (latest-version mode, from "now") of every container the artifact uses (the default
 //     one and ARTIFACT_CONTAINERS, ArtifactStore.cs), read every second while anyone is subscribed and stopped a
-//     minute after the last one leaves. It reports creates and updates made through any replica. It is always read
-//     with the server's managed identity, even with token passthrough on (it is a Data Reader then): it only ever
-//     publishes collection names, never data.
+//     minute after the last one leaves. It reports creates and updates made through any replica. It is read with the
+//     server's managed identity, a Data Reader: it only ever publishes collection names, never data.
 //   - This replica's own writes (db_set, db_update, db_delete), published at once. The change feed doesn't report
 //     deletes, so a delete made through another replica reaches /events pages only when they next re-read.
 using System.Collections.Concurrent;
@@ -157,11 +156,9 @@ public static class ArtifactEventsEndpoint
     // Under Azure Functions' 230-second limit on an HTTP response, so the stream ends cleanly before the platform cuts it.
     private static readonly TimeSpan MaxStream = TimeSpan.FromSeconds(200);
 
-    /// <summary>GET /events: server-sent events, one "change" per changed collection, for callers with a level (with
-    /// token passthrough on, for anyone signed in: Cosmos DB, not their level, decides what they can read).</summary>
-    /// <summary>Who may hear about changes: callers with a level, or with token passthrough on, anyone signed in.</summary>
-    public static bool MayListen(ArtifactViewer viewer) =>
-        CosmosTokenPassthrough.Enabled ? viewer.Id is not null : viewer.Level is not null;
+    /// <summary>Who may hear about changes (GET /events, server-sent events with one "change" per changed collection,
+    /// and /events/negotiate): callers with a level, so the owner and the people in policy.json's cosmos.access.</summary>
+    public static bool MayListen(ArtifactViewer viewer) => viewer.Level is not null;
 
     public static async Task Handle(HttpContext context)
     {

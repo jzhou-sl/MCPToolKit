@@ -1,11 +1,10 @@
 // On-behalf-of (docs/app-registration-plan.md): a caller who signs in with Entra (Claude Code, Claude, the local host)
 // reaches Cosmos DB as themselves with nothing pasted. Their bearer token is for the MCP server's app registration
 // (AzureAd__ClientId); the server exchanges it at Entra for a Cosmos DB token for the same person, so Cosmos DB's role
-// assignments (per container, from policy.json's cosmos.access) decide, as with token passthrough.
+// assignments (per container, from policy.json's cosmos.access) decide.
 //
-// On only with COSMOS_TOKEN_PASSTHROUGH (the "as the caller" mode: db rules off, the managed identity only reads the
-// change feed) and the registration's settings. Ticket callers (the page) have no Entra token, so they still send
-// X-Cosmos-Token (CosmosTokenPassthrough.cs); for an Entra caller this wins over that header.
+// On whenever the registration's settings are there. Callers without an Entra token (tickets) can still send their
+// own Cosmos DB token (CosmosTokenPassthrough.cs); for an Entra caller this wins over that.
 //
 // The server proves it is the app registration with no secret: a federated credential on the registration trusts the
 // Function app's managed identity (AZURE_CLIENT_ID), whose token for api://AzureADTokenExchange is the client
@@ -28,7 +27,7 @@ public static class CosmosOnBehalfOf
         Environment.GetEnvironmentVariable(name) is { Length: > 0 } v && !string.IsNullOrWhiteSpace(v) ? v.Trim() : null;
 
     public static bool Enabled =>
-        CosmosTokenPassthrough.Enabled && Setting("AzureAd__TenantId") is not null && Setting("AzureAd__ClientId") is not null;
+        Setting("AzureAd__TenantId") is not null && Setting("AzureAd__ClientId") is not null;
 
     /// <summary>Makes the credential for one caller's bearer token. Tests replace it so they needn't reach Entra.</summary>
     public static Func<string, TokenCredential> CredentialFor { get; set; } = NewCredential;
